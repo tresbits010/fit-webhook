@@ -3,7 +3,6 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const admin = require('firebase-admin');
 
-// ✅ Usar clave desde variable de entorno
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
@@ -13,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 
 app.use(bodyParser.json());
 
-// ✅ Crear link de pago para licencia
 app.get('/crear-link-pago', async (req, res) => {
   const gimnasioId = req.query.gimnasioId;
   const plan = req.query.plan;
@@ -30,6 +28,7 @@ app.get('/crear-link-pago', async (req, res) => {
     const data = planDoc.data();
     let precio = data.precio;
     const duracion = data.duracion;
+    const nombrePlan = data.nombre || plan;
 
     let descuento = 0;
     if (ref) {
@@ -51,15 +50,16 @@ app.get('/crear-link-pago', async (req, res) => {
     const accessToken = config.accessToken;
 
     const precioFinal = Math.round(precio * (1 - descuento / 100));
+    const title = `Licencia ${nombrePlan} (${duracion} días)`;
 
     const preferencia = {
       items: [{
-        title: `Licencia ${plan} (${duracion} días)`,
+        title,
         quantity: 1,
         currency_id: "ARS",
         unit_price: precioFinal
       }],
-      external_reference: `gimnasioId:${gimnasioId};plan:${plan}`,
+      external_reference: `tipo:licencia;gim:${gimnasioId};plan:${nombrePlan}`,
       notification_url: "https://fit-webhook.onrender.com/webhook"
     };
 
@@ -76,7 +76,6 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
-// ✅ Crear link de venta de producto
 app.get('/crear-link-venta', async (req, res) => {
   const { gimnasioId, dni, producto, precio } = req.query;
 
@@ -91,9 +90,11 @@ app.get('/crear-link-venta', async (req, res) => {
     const config = configDoc.data();
     const accessToken = config.accessToken;
 
+    const title = producto;
+
     const preferencia = {
       items: [{
-        title: producto,
+        title,
         quantity: 1,
         currency_id: "ARS",
         unit_price: parseFloat(precio)
@@ -115,7 +116,6 @@ app.get('/crear-link-venta', async (req, res) => {
   }
 });
 
-// ✅ Webhook con validación de collector_id
 app.post('/webhook', async (req, res) => {
   try {
     const paymentId = req.body.data.id;
@@ -129,7 +129,7 @@ app.post('/webhook', async (req, res) => {
     if (payment.status !== 'approved') return res.status(200).send('No procesado');
 
     const reference = payment.external_reference;
-    const gimnasioIdMatch = reference.match(/gimnasioId:([^;]+)/);
+    const gimnasioIdMatch = reference.match(/gim:([^;]+)/);
     if (!gimnasioIdMatch) return res.status(400).send('Falta gimnasioId');
     const gimnasioId = gimnasioIdMatch[1];
 
@@ -154,17 +154,19 @@ app.post('/webhook', async (req, res) => {
         cliente: payment.payer?.email || "cliente",
         dniCliente,
         fecha: new Date().toISOString(),
-        estado: "pendiente"
+        estado: "pendiente",
+        titulo: payment.additional_info?.items?.[0]?.title || producto
       };
 
       await db.collection('gimnasios').doc(gimnasioId).collection('ventas').add(venta);
       console.log(`🛒 Venta registrada: ${producto} (${dniCliente})`);
     } else {
       const partes = reference.split(';');
-      const plan = partes[1].split(':')[1];
+      const planNombre = partes.find(p => p.startsWith('plan:')).split(':')[1];
 
-      const planDoc = await db.collection('planesLicencia').doc(plan).get();
-      const dias = planDoc.exists ? planDoc.data().duracion : 30;
+      const planDoc = await db.collection('planesLicencia').where('nombre', '==', planNombre).limit(1).get();
+      const planData = !planDoc.empty ? planDoc.docs[0].data() : { duracion: 30 };
+      const dias = planData.duracion;
 
       const now = new Date();
       let fechaInicio = now;
@@ -185,9 +187,11 @@ app.post('/webhook', async (req, res) => {
       const fechaVencimiento = new Date(fechaInicio);
       fechaVencimiento.setDate(fechaVencimiento.getDate() + dias);
 
+      const titulo = payment.additional_info?.items?.[0]?.title || planNombre;
+
       await licenciaRef.set({
         estadoLicencia: 'activa',
-        tipoLicencia: plan,
+        tipoLicencia: planNombre,
         fechaInicio: fechaInicio.toISOString().split('T')[0],
         fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
       }, { merge: true });
@@ -198,12 +202,13 @@ app.post('/webhook', async (req, res) => {
           fechaOperacion: new Date().toISOString(),
           tipo: 'compra_licencia',
           metodo: 'webhook',
-          plan,
+          plan: planNombre,
           dias,
           monto: payment.transaction_amount,
           paymentId,
           fechaInicio: fechaInicio.toISOString().split('T')[0],
-          fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
+          fechaVencimiento: fechaVencimiento.toISOString().split('T')[0],
+          titulo
         });
 
       console.log(`✅ Licencia activada para ${gimnasioId} (${dias} días sumados desde ${fechaInicio.toISOString().split('T')[0]})`);
