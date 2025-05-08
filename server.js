@@ -142,22 +142,35 @@ app.post('/webhook', async (req, res) => {
         const planDoc = await db.collection('planesLicencia').doc(plan).get();
         const dias = planDoc.exists ? planDoc.data().duracion : 30;
 
-        const fechaInicio = new Date();
-        const fechaVencimiento = new Date();
-        fechaVencimiento.setDate(fechaInicio.getDate() + dias);
+        // ⏳ Verificar días restantes
+        let fechaInicio = new Date();
+        let fechaVencimiento = new Date();
+        let diasExtras = 0;
 
-        await db.collection('gimnasios')
-                .doc(gimnasioId)
-                .collection('licencia')
-                .doc('datos')
-                .set({
-                  estadoLicencia: 'activa',
-                  tipoLicencia: plan,
-                  fechaInicio: fechaInicio.toISOString().split('T')[0],
-                  fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
-                }, { merge: true });
+        const licenciaRef = db.collection('gimnasios').doc(gimnasioId).collection('licencia').doc('datos');
+        const licenciaSnap = await licenciaRef.get();
 
-        console.log(`✅ Licencia activada para ${gimnasioId}`);
+        if (licenciaSnap.exists) {
+          const lic = licenciaSnap.data();
+          const vencStr = lic.fechaVencimiento;
+          if (vencStr) {
+            const vencActual = new Date(vencStr);
+            if (vencActual > fechaInicio) {
+              diasExtras = Math.ceil((vencActual - fechaInicio) / (1000 * 60 * 60 * 24));
+            }
+          }
+        }
+
+        fechaVencimiento.setDate(fechaInicio.getDate() + dias + diasExtras);
+
+        await licenciaRef.set({
+          estadoLicencia: 'activa',
+          tipoLicencia: plan,
+          fechaInicio: fechaInicio.toISOString().split('T')[0],
+          fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
+        }, { merge: true });
+
+        console.log(`✅ Licencia actualizada (${dias} días + ${diasExtras} extra) para ${gimnasioId}`);
       }
     }
 
