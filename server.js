@@ -44,6 +44,12 @@ app.get('/crear-link-pago', async (req, res) => {
       }
     }
 
+    const configDoc = await db.collection('gimnasios').doc(gimnasioId).collection('configuracionMercadoPago').doc('datos').get();
+    if (!configDoc.exists) return res.status(400).send('Configuración MP no encontrada');
+
+    const config = configDoc.data();
+    const accessToken = config.accessToken;
+
     const precioFinal = Math.round(precio * (1 - descuento / 100));
 
     const preferencia = {
@@ -59,7 +65,7 @@ app.get('/crear-link-pago', async (req, res) => {
 
     const response = await axios.post('https://api.mercadopago.com/checkout/preferences', preferencia, {
       headers: {
-        Authorization: `Bearer ${process.env.ACCESS_TOKEN_MP}`
+        Authorization: `Bearer ${accessToken}`
       }
     });
 
@@ -70,7 +76,7 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
-// ✅ Crear link de pago para venta de producto
+// ✅ Crear link de venta de producto
 app.get('/crear-link-venta', async (req, res) => {
   const { gimnasioId, dni, producto, precio } = req.query;
 
@@ -79,6 +85,12 @@ app.get('/crear-link-venta', async (req, res) => {
   }
 
   try {
+    const configDoc = await db.collection('gimnasios').doc(gimnasioId).collection('configuracionMercadoPago').doc('datos').get();
+    if (!configDoc.exists) return res.status(400).send('Configuración MP no encontrada');
+
+    const config = configDoc.data();
+    const accessToken = config.accessToken;
+
     const preferencia = {
       items: [{
         title: producto,
@@ -92,7 +104,7 @@ app.get('/crear-link-venta', async (req, res) => {
 
     const response = await axios.post('https://api.mercadopago.com/checkout/preferences', preferencia, {
       headers: {
-        Authorization: `Bearer ${process.env.ACCESS_TOKEN_MP}`
+        Authorization: `Bearer ${accessToken}`
       }
     });
 
@@ -103,7 +115,7 @@ app.get('/crear-link-venta', async (req, res) => {
   }
 });
 
-// ✅ Webhook MercadoPago
+// ✅ Webhook con validación de collector_id
 app.post('/webhook', async (req, res) => {
   try {
     const paymentId = req.body.data.id;
@@ -114,64 +126,87 @@ app.post('/webhook', async (req, res) => {
     });
 
     const payment = response.data;
-    if (payment.status === 'approved') {
-      const reference = payment.external_reference;
+    if (payment.status !== 'approved') return res.status(200).send('No procesado');
 
-      if (reference.startsWith('tipo:venta')) {
-        const partes = reference.split(';');
-        const gimnasioId = partes.find(p => p.startsWith('gim:')).split(':')[1];
-        const dniCliente = partes.find(p => p.startsWith('dni:')).split(':')[1];
-        const producto = partes.find(p => p.startsWith('producto:')).split(':')[1];
+    const reference = payment.external_reference;
+    const gimnasioIdMatch = reference.match(/gimnasioId:([^;]+)/);
+    if (!gimnasioIdMatch) return res.status(400).send('Falta gimnasioId');
+    const gimnasioId = gimnasioIdMatch[1];
 
-        const venta = {
-          producto,
-          precio: payment.transaction_amount,
-          cliente: payment.payer?.email || "cliente",
-          dniCliente,
-          fecha: new Date().toISOString(),
-          estado: "pendiente"
-        };
+    const configDoc = await db.collection('gimnasios').doc(gimnasioId).collection('configuracionMercadoPago').doc('datos').get();
+    if (!configDoc.exists) return res.status(403).send('Config MP no encontrada');
 
-        await db.collection('gimnasios').doc(gimnasioId).collection('ventas').add(venta);
-        console.log(`🛒 Venta registrada: ${producto} (${dniCliente})`);
-      } else {
-        const partes = reference.split(';');
-        const gimnasioId = partes[0].split(':')[1];
-        const plan = partes[1].split(':')[1];
+    const config = configDoc.data();
+    const expectedCollector = config.collectorId;
+    if (payment.collector_id.toString() !== expectedCollector.toString()) {
+      console.warn(`⚠️ collector_id inválido para ${gimnasioId}`);
+      return res.status(403).send('CollectorId no coincide');
+    }
 
-        const planDoc = await db.collection('planesLicencia').doc(plan).get();
-        const dias = planDoc.exists ? planDoc.data().duracion : 30;
+    if (reference.startsWith('tipo:venta')) {
+      const partes = reference.split(';');
+      const dniCliente = partes.find(p => p.startsWith('dni:')).split(':')[1];
+      const producto = partes.find(p => p.startsWith('producto:')).split(':')[1];
 
-        // ⏳ Verificar días restantes
-        let fechaInicio = new Date();
-        let fechaVencimiento = new Date();
-        let diasExtras = 0;
+      const venta = {
+        producto,
+        precio: payment.transaction_amount,
+        cliente: payment.payer?.email || "cliente",
+        dniCliente,
+        fecha: new Date().toISOString(),
+        estado: "pendiente"
+      };
 
-        const licenciaRef = db.collection('gimnasios').doc(gimnasioId).collection('licencia').doc('datos');
-        const licenciaSnap = await licenciaRef.get();
+      await db.collection('gimnasios').doc(gimnasioId).collection('ventas').add(venta);
+      console.log(`🛒 Venta registrada: ${producto} (${dniCliente})`);
+    } else {
+      const partes = reference.split(';');
+      const plan = partes[1].split(':')[1];
 
-        if (licenciaSnap.exists) {
-          const lic = licenciaSnap.data();
-          const vencStr = lic.fechaVencimiento;
-          if (vencStr) {
-            const vencActual = new Date(vencStr);
-            if (vencActual > fechaInicio) {
-              diasExtras = Math.ceil((vencActual - fechaInicio) / (1000 * 60 * 60 * 24));
-            }
+      const planDoc = await db.collection('planesLicencia').doc(plan).get();
+      const dias = planDoc.exists ? planDoc.data().duracion : 30;
+
+      const now = new Date();
+      let fechaInicio = now;
+
+      const licenciaRef = db.collection('gimnasios').doc(gimnasioId).collection('licencia').doc('datos');
+      const licenciaSnap = await licenciaRef.get();
+
+      if (licenciaSnap.exists) {
+        const vencStr = licenciaSnap.get("fechaVencimiento");
+        if (vencStr) {
+          const vencActual = new Date(vencStr);
+          if (vencActual > now) {
+            fechaInicio = vencActual;
           }
         }
+      }
 
-        fechaVencimiento.setDate(fechaInicio.getDate() + dias + diasExtras);
+      const fechaVencimiento = new Date(fechaInicio);
+      fechaVencimiento.setDate(fechaVencimiento.getDate() + dias);
 
-        await licenciaRef.set({
-          estadoLicencia: 'activa',
-          tipoLicencia: plan,
+      await licenciaRef.set({
+        estadoLicencia: 'activa',
+        tipoLicencia: plan,
+        fechaInicio: fechaInicio.toISOString().split('T')[0],
+        fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
+      }, { merge: true });
+
+      await db.collection('gimnasios').doc(gimnasioId)
+        .collection('licencia').doc('bitacoraLicencia').collection('entradas')
+        .add({
+          fechaOperacion: new Date().toISOString(),
+          tipo: 'compra_licencia',
+          metodo: 'webhook',
+          plan,
+          dias,
+          monto: payment.transaction_amount,
+          paymentId,
           fechaInicio: fechaInicio.toISOString().split('T')[0],
           fechaVencimiento: fechaVencimiento.toISOString().split('T')[0]
-        }, { merge: true });
+        });
 
-        console.log(`✅ Licencia actualizada (${dias} días + ${diasExtras} extra) para ${gimnasioId}`);
-      }
+      console.log(`✅ Licencia activada para ${gimnasioId} (${dias} días sumados desde ${fechaInicio.toISOString().split('T')[0]})`);
     }
 
     res.status(200).send('Webhook recibido');
