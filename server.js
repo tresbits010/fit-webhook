@@ -1,6 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const { MercadoPagoConfig } = require('mercadopago');
+const mercadopago = require('mercadopago');
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
 
