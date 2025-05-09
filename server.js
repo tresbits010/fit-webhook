@@ -1,141 +1,85 @@
-// 📦 fit-webhook ajustado a tu proyecto FitSuite Pro
 const express = require('express');
+const bodyParser = require('body-parser');
+const { MercadoPagoConfig } = require('mercadopago');
 const admin = require('firebase-admin');
-const mercadopago = require('mercadopago');
-const axios = require('axios');
-const { v4: uuidv4 } = require('uuid');
+const dotenv = require('dotenv');
 
-// 🔐 Inicialización
+// Cargar variables de entorno desde .env si existe
+dotenv.config();
+
+// 🔐 Configurar Firebase con claves del entorno
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-mercadopago.configurations.setAccessToken(process.env.MP_ACCESS_TOKEN);
+// 🔐 Configurar MercadoPago
+const mpClient = new MercadoPagoConfig({ accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN });
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+app.use(bodyParser.json());
 
-// 🔗 1. Generar link de pago para licencia con referidos
-app.get('/generar-link', async (req, res) => {
-  const { gimnasioId, planId, ref } = req.query;
+// 📌 Endpoint para crear link de pago
+app.get('/crear-link-pago', async (req, res) => {
+  const gimnasioId = req.query.gimnasioId;
+  const plan = req.query.plan;
+  const ref = req.query.ref || null;
 
-  if (!gimnasioId || !planId) return res.status(400).send('Faltan parámetros');
+  if (!gimnasioId || !plan) {
+    return res.status(400).send('❌ Faltan parámetros: gimnasioId y plan');
+  }
 
   try {
-    const planSnap = await db.collection('planesLicencia').doc(planId).get();
-    if (!planSnap.exists) return res.status(404).send('Plan no encontrado');
+    const planDoc = await db.collection('planesLicencia').doc(plan).get();
+    if (!planDoc.exists) return res.status(404).send('❌ El plan no existe');
 
-    const plan = planSnap.data();
-    let precio = plan.precio;
-    let descuento = 0;
+    const data = planDoc.data();
+    let precio = data.precio;
+    const duracion = data.duracion || 30;
 
+    // 🎁 Descuento por referidos
     if (ref) {
-      const refSnap = await db.collection('referidos').doc(ref).get();
-      if (refSnap.exists) {
-        descuento = Math.min((refSnap.data().usos || 0) * 2, 30);
-        await db.collection('referidos').doc(ref).update({
-          usos: admin.firestore.FieldValue.increment(1),
-          ultimoUso: new Date().toISOString(),
-        });
+      const refDoc = await db.collection('referidos').doc(ref).get();
+      if (refDoc.exists) {
+        const refData = refDoc.data();
+        const comprasValidas = refData.comprasValidas || 0;
+        const descuento = Math.min(comprasValidas * 0.01, 0.3); // máx 30%
+        precio = Math.round(precio * (1 - descuento));
       }
     }
 
-    const configSnap = await db.collection('gimnasios').doc(gimnasioId).collection('configuracionMercadoPago').doc('datos').get();
-    if (!configSnap.exists) return res.status(403).send('Config MP no encontrada');
-
-    const accessToken = configSnap.data().accessToken;
-    const precioFinal = precio * (1 - descuento / 100);
-
-    const preferencia = {
+    // 🧾 Crear preferencia de pago
+    const preference = {
       items: [
         {
-          title: `Licencia ${plan.nombre} (${plan.duracion} días)` + (descuento > 0 ? ` -${descuento}%` : ''),
+          title: `Licencia ${data.nombre}`,
           quantity: 1,
-          currency_id: 'ARS',
-          unit_price: precioFinal,
-        },
+          unit_price: precio
+        }
       ],
-      external_reference: `tipo:licencia;gim:${gimnasioId};plan:${plan.nombre}` + (ref ? `;ref:${ref}` : ''),
-      notification_url: process.env.WEBHOOK_URL,
-      back_urls: { success: process.env.FRONTEND_URL || 'https://tresbits.com/success' },
+      external_reference: gimnasioId,
+      back_urls: {
+        success: 'https://fitsuite-pro.web.app/pago-exitoso',
+        failure: 'https://fitsuite-pro.web.app/pago-fallido',
+        pending: 'https://fitsuite-pro.web.app/pago-pendiente'
+      },
+      auto_return: 'approved'
     };
 
-    const response = await axios.post('https://api.mercadopago.com/checkout/preferences', preferencia, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const result = await mpClient.preference.create({ body: preference });
 
-    res.json({ link: response.data.init_point, descuento });
-  } catch (err) {
-    console.error('❌ Error generando link:', err);
+    res.status(200).json({
+      link: result.init_point,
+      id: result.id,
+      precioFinal: precio
+    });
+  } catch (error) {
+    console.error('❌ Error al crear link de pago:', error);
     res.status(500).send('Error interno');
   }
 });
 
-// 🧠 2. Webhook para procesar pagos
-app.post('/webhook', async (req, res) => {
-  try {
-    const paymentId = req.body.data.id;
-    const payment = await mercadopago.payment.get(paymentId);
-    const info = payment.body;
-
-    if (info.status !== 'approved') return res.status(200).send('Pago no aprobado');
-
-    const refParts = info.external_reference.split(';');
-    const gimnasioId = refParts.find(p => p.startsWith('gim:'))?.split(':')[1];
-    const planNombre = refParts.find(p => p.startsWith('plan:'))?.split(':')[1];
-
-    if (!gimnasioId || !planNombre) return res.status(400).send('Referencia inválida');
-
-    const configSnap = await db.collection('gimnasios').doc(gimnasioId).collection('configuracionMercadoPago').doc('datos').get();
-    if (!configSnap.exists || info.collector_id.toString() !== configSnap.data().collectorId.toString())
-      return res.status(403).send('Collector ID inválido');
-
-    const planSnap = await db.collection('planesLicencia').where('nombre', '==', planNombre).limit(1).get();
-    const plan = !planSnap.empty ? planSnap.docs[0].data() : { duracion: 30 };
-
-    const licenciaRef = db.collection('gimnasios').doc(gimnasioId).collection('licencia').doc('datos');
-    const licenciaSnap = await licenciaRef.get();
-
-    const ahora = new Date();
-    let inicio = ahora;
-
-    if (licenciaSnap.exists) {
-      const vencimiento = new Date(licenciaSnap.data().fechaVencimiento);
-      if (vencimiento > ahora) inicio = vencimiento;
-    }
-
-    const vencimiento = new Date(inicio);
-    vencimiento.setDate(vencimiento.getDate() + plan.duracion);
-
-    await licenciaRef.set({
-      estadoLicencia: 'activa',
-      tipoLicencia: planNombre,
-      fechaInicio: inicio.toISOString().split('T')[0],
-      fechaVencimiento: vencimiento.toISOString().split('T')[0]
-    }, { merge: true });
-
-    await db.collection('gimnasios').doc(gimnasioId)
-      .collection('licencia').doc('bitacoraLicencia')
-      .collection('entradas').add({
-        fechaOperacion: new Date().toISOString(),
-        tipo: 'compra_licencia',
-        metodo: 'webhook',
-        plan: planNombre,
-        dias: plan.duracion,
-        monto: info.transaction_amount,
-        paymentId,
-        fechaInicio: inicio.toISOString().split('T')[0],
-        fechaVencimiento: vencimiento.toISOString().split('T')[0],
-        titulo: info.description || planNombre
-      });
-
-    res.status(200).send('✅ Licencia procesada');
-  } catch (error) {
-    console.error('❌ Webhook error:', error);
-    res.status(500).send('Error procesando webhook');
-  }
+// 🟢 Servidor online
+app.listen(PORT, () => {
+  console.log(`✅ Webhook corriendo en http://localhost:${PORT}`);
 });
-
-// 🚀 Inicio
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🟢 FitSuite Pro Webhook en puerto ${PORT}`));
