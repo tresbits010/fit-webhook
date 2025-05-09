@@ -4,82 +4,115 @@ const { MercadoPagoConfig } = require('mercadopago');
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
 
-// Cargar variables de entorno desde .env si existe
-dotenv.config();
-
-// 🔐 Configurar Firebase con claves del entorno
+// Configuración inicial
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// 🔐 Configurar MercadoPago
-const mpClient = new MercadoPagoConfig({ accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN });
+mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-app.use(bodyParser.json());
+app.use(express.json());
 
-// 📌 Endpoint para crear link de pago
-app.get('/crear-link-pago', async (req, res) => {
-  const gimnasioId = req.query.gimnasioId;
-  const plan = req.query.plan;
-  const ref = req.query.ref || null;
+// 📌 WEBHOOK DE LICENCIAS AUTOMÁTICAS
+app.post('/webhook', async (req, res) => {
+    try {
+        // Validación de seguridad (si usás firma custom, implementá aquí)
+        const paymentId = req.body.data.id;
+        const payment = await mercadopago.payment.get(paymentId);
 
-  if (!gimnasioId || !plan) {
-    return res.status(400).send('❌ Faltan parámetros: gimnasioId y plan');
-  }
-
-  try {
-    const planDoc = await db.collection('planesLicencia').doc(plan).get();
-    if (!planDoc.exists) return res.status(404).send('❌ El plan no existe');
-
-    const data = planDoc.data();
-    let precio = data.precio;
-    const duracion = data.duracion || 30;
-
-    // 🎁 Descuento por referidos
-    if (ref) {
-      const refDoc = await db.collection('referidos').doc(ref).get();
-      if (refDoc.exists) {
-        const refData = refDoc.data();
-        const comprasValidas = refData.comprasValidas || 0;
-        const descuento = Math.min(comprasValidas * 0.01, 0.3); // máx 30%
-        precio = Math.round(precio * (1 - descuento));
-      }
-    }
-
-    // 🧾 Crear preferencia de pago
-    const preference = {
-      items: [
-        {
-          title: `Licencia ${data.nombre}`,
-          quantity: 1,
-          unit_price: precio
+        if (payment.body.status !== 'approved') {
+            return res.status(200).send('Pago no aprobado');
         }
-      ],
-      external_reference: gimnasioId,
-      back_urls: {
-        success: 'https://fitsuite-pro.web.app/pago-exitoso',
-        failure: 'https://fitsuite-pro.web.app/pago-fallido',
-        pending: 'https://fitsuite-pro.web.app/pago-pendiente'
-      },
-      auto_return: 'approved'
-    };
 
-    const result = await mpClient.preference.create({ body: preference });
+        // Desglosar referencia externa: gym:xxx|plan:xxx|ref:xxx
+        const [gymPart, planPart, refPart] = payment.body.external_reference.split('|');
+        const gymId = gymPart.split(':')[1];
+        const planId = planPart.split(':')[1];
+        const referidoDe = refPart?.split(':')[1] || null;
 
-    res.status(200).json({
-      link: result.init_point,
-      id: result.id,
-      precioFinal: precio
-    });
-  } catch (error) {
-    console.error('❌ Error al crear link de pago:', error);
-    res.status(500).send('Error interno');
-  }
+        const gymRef = db.collection('gimnasios').doc(gymId);
+        const licenciaRef = gymRef.collection('licencia').doc('datos');
+
+        await db.runTransaction(async (transaction) => {
+            // Obtener plan
+            const planSnap = await db.collection('planesLicencia').doc(planId).get();
+            if (!planSnap.exists) throw new Error("Plan no encontrado");
+
+            const duracion = planSnap.data().duracion || 30;
+            const planNombre = planSnap.data().nombre || planId;
+            const montoOriginal = planSnap.data().precio;
+
+            // Obtener licencia actual
+            const licenciaSnap = await transaction.get(licenciaRef);
+            const fechaActual = new Date();
+
+            let fechaInicio = fechaActual;
+            if (licenciaSnap.exists) {
+                const vencimiento = licenciaSnap.data().fechaVencimiento?.toDate();
+                if (vencimiento && vencimiento > fechaActual) {
+                    fechaInicio = vencimiento;
+                }
+            }
+
+            const nuevaVencimiento = new Date(fechaInicio);
+            nuevaVencimiento.setDate(nuevaVencimiento.getDate() + duracion);
+
+            const montoPagado = payment.body.transaction_amount;
+            const descuentoAplicado = Math.round((1 - (montoPagado / montoOriginal)) * 100);
+
+            // ✅ Actualizar licencia
+            transaction.set(licenciaRef, {
+                estado: 'activa',
+                plan: planId,
+                planNombre,
+                fechaInicio,
+                fechaVencimiento: nuevaVencimiento,
+                ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            // ✅ Registrar transacción
+            transaction.set(gymRef.collection('transacciones').doc(paymentId), {
+                monto: montoPagado,
+                fecha: admin.firestore.FieldValue.serverTimestamp(),
+                metodo: payment.body.payment_type_id,
+                referidoDe,
+                descuentoAplicado,
+                detalle: `Licencia ${planId} - ${payment.body.description}`
+            });
+
+            // ✅ Historial de renovaciones
+            transaction.set(gymRef.collection('licenciaHistorial').doc(), {
+                fecha: admin.firestore.FieldValue.serverTimestamp(),
+                plan: planId,
+                referidoDe,
+                descuentoAplicado,
+                montoPagado
+            });
+
+            // ✅ Acumulado del referido (si existe)
+            if (referidoDe) {
+                const refDoc = db.collection('referidos').doc(referidoDe);
+                transaction.update(refDoc, {
+                    descuentoAcumulado: admin.firestore.FieldValue.increment(descuentoAplicado)
+                });
+            }
+        });
+
+        // ✅ Notificación push al gimnasio (opcional)
+        await admin.messaging().sendToTopic(gymId, {
+            notification: {
+                title: '🎉 ¡Licencia Renovada!',
+                body: `Tu plan ${planId} está activo hasta ${nuevaVencimiento.toLocaleDateString()}`
+            }
+        });
+
+        res.status(200).send('OK');
+    } catch (error) {
+        console.error('❌ Error en webhook:', error);
+        res.status(500).send('Error procesando pago');
+    }
 });
 
-// 🟢 Servidor online
-app.listen(PORT, () => {
-  console.log(`✅ Webhook corriendo en http://localhost:${PORT}`);
-});
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 Webhook activo en puerto ${PORT}`));
