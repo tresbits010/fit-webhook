@@ -4,20 +4,59 @@ const mercadopago = require('mercadopago');
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
 
+dotenv.config();
+
 // Configuración inicial
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
+mercadopago.configure({ access_token: process.env.ACCESS_TOKEN_MP });
 
 const app = express();
 app.use(express.json());
 
+// 📌 GENERADOR DE LINK DE PAGO
+app.get('/crear-link-pago', async (req, res) => {
+    const { gimnasioId, plan, ref } = req.query;
+
+    if (!gimnasioId || !plan) {
+        return res.status(400).send('Faltan parámetros');
+    }
+
+    try {
+        const planSnap = await db.collection('planesLicencia').doc(plan).get();
+        if (!planSnap.exists) return res.status(404).send('Plan no encontrado');
+
+        const datos = planSnap.data();
+        const precio = datos.precio || 0;
+        const nombrePlan = datos.nombre || 'Licencia';
+
+        const preference = {
+            items: [{
+                title: `Licencia ${nombrePlan}`,
+                unit_price: precio,
+                quantity: 1
+            }],
+            external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}`,
+            back_urls: {
+                success: 'https://fit-webhook.onrender.com/success',
+                failure: 'https://fit-webhook.onrender.com/failure'
+            },
+            auto_return: 'approved'
+        };
+
+        const response = await mercadopago.preferences.create(preference);
+        return res.send(response.body.init_point);
+    } catch (error) {
+        console.error('❌ Error al generar link:', error);
+        return res.status(500).send('Error al generar link de pago');
+    }
+});
+
 // 📌 WEBHOOK DE LICENCIAS AUTOMÁTICAS
 app.post('/webhook', async (req, res) => {
     try {
-        // Validación de seguridad (si usás firma custom, implementá aquí)
         const paymentId = req.body.data.id;
         const payment = await mercadopago.payment.get(paymentId);
 
@@ -25,7 +64,6 @@ app.post('/webhook', async (req, res) => {
             return res.status(200).send('Pago no aprobado');
         }
 
-        // Desglosar referencia externa: gym:xxx|plan:xxx|ref:xxx
         const [gymPart, planPart, refPart] = payment.body.external_reference.split('|');
         const gymId = gymPart.split(':')[1];
         const planId = planPart.split(':')[1];
@@ -35,7 +73,6 @@ app.post('/webhook', async (req, res) => {
         const licenciaRef = gymRef.collection('licencia').doc('datos');
 
         await db.runTransaction(async (transaction) => {
-            // Obtener plan
             const planSnap = await db.collection('planesLicencia').doc(planId).get();
             if (!planSnap.exists) throw new Error("Plan no encontrado");
 
@@ -43,7 +80,6 @@ app.post('/webhook', async (req, res) => {
             const planNombre = planSnap.data().nombre || planId;
             const montoOriginal = planSnap.data().precio;
 
-            // Obtener licencia actual
             const licenciaSnap = await transaction.get(licenciaRef);
             const fechaActual = new Date();
 
@@ -61,17 +97,16 @@ app.post('/webhook', async (req, res) => {
             const montoPagado = payment.body.transaction_amount;
             const descuentoAplicado = Math.round((1 - (montoPagado / montoOriginal)) * 100);
 
-            // ✅ Actualizar licencia
             transaction.set(licenciaRef, {
                 estado: 'activa',
                 plan: planId,
                 planNombre,
                 fechaInicio,
                 fechaVencimiento: nuevaVencimiento,
-                ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp()
+                ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp(),
+                usoTrial: false
             }, { merge: true });
 
-            // ✅ Registrar transacción
             transaction.set(gymRef.collection('transacciones').doc(paymentId), {
                 monto: montoPagado,
                 fecha: admin.firestore.FieldValue.serverTimestamp(),
@@ -81,7 +116,6 @@ app.post('/webhook', async (req, res) => {
                 detalle: `Licencia ${planId} - ${payment.body.description}`
             });
 
-            // ✅ Historial de renovaciones
             transaction.set(gymRef.collection('licenciaHistorial').doc(), {
                 fecha: admin.firestore.FieldValue.serverTimestamp(),
                 plan: planId,
@@ -90,7 +124,6 @@ app.post('/webhook', async (req, res) => {
                 montoPagado
             });
 
-            // ✅ Acumulado del referido (si existe)
             if (referidoDe) {
                 const refDoc = db.collection('referidos').doc(referidoDe);
                 transaction.update(refDoc, {
@@ -99,11 +132,10 @@ app.post('/webhook', async (req, res) => {
             }
         });
 
-        // ✅ Notificación push al gimnasio (opcional)
         await admin.messaging().sendToTopic(gymId, {
             notification: {
                 title: '🎉 ¡Licencia Renovada!',
-                body: `Tu plan ${planId} está activo hasta ${nuevaVencimiento.toLocaleDateString()}`
+                body: `Tu plan ${planId} está activo hasta ${new Date().toLocaleDateString()}`
             }
         });
 
