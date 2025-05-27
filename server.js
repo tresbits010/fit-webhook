@@ -11,7 +11,7 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-mercadopago.configure({ access_token: process.env.ACCESS_TOKEN_MP });
+mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 const app = express();
 app.use(express.json());
