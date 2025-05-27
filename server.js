@@ -6,7 +6,6 @@ const dotenv = require('dotenv');
 
 dotenv.config();
 
-// Configuración inicial
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
@@ -16,26 +15,20 @@ mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 const app = express();
 app.use(express.json());
 
-// 📌 GENERADOR DE LINK DE PAGO
+// ✅ CREAR LINK DE PAGO
 app.get('/crear-link-pago', async (req, res) => {
     const { gimnasioId, plan, ref } = req.query;
-
-    if (!gimnasioId || !plan) {
-        return res.status(400).send('Faltan parámetros');
-    }
+    if (!gimnasioId || !plan) return res.status(400).send('Faltan parámetros');
 
     try {
         const planSnap = await db.collection('planesLicencia').doc(plan).get();
         if (!planSnap.exists) return res.status(404).send('Plan no encontrado');
 
         const datos = planSnap.data();
-        const precio = datos.precio || 0;
-        const nombrePlan = datos.nombre || 'Licencia';
-
         const preference = {
             items: [{
-                title: `Licencia ${nombrePlan}`,
-                unit_price: precio,
+                title: `Licencia ${datos.nombre || 'Licencia'}`,
+                unit_price: datos.precio || 0,
                 quantity: 1
             }],
             external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}`,
@@ -54,41 +47,41 @@ app.get('/crear-link-pago', async (req, res) => {
     }
 });
 
-// 📌 WEBHOOK DE LICENCIAS AUTOMÁTICAS
+// ✅ PROCESAR PAGO EN WEBHOOK
 app.post('/webhook', async (req, res) => {
     try {
+        console.log("Webhook recibido:", JSON.stringify(req.body));
+        if (!req.body.data?.id) return res.status(400).send('ID no presente');
+
         const paymentId = req.body.data.id;
         const payment = await mercadopago.payment.get(paymentId);
+        if (payment.body.status !== 'approved') return res.status(200).send('Pago no aprobado');
 
-        if (payment.body.status !== 'approved') {
-            return res.status(200).send('Pago no aprobado');
-        }
-
-        const [gymPart, planPart, refPart] = payment.body.external_reference.split('|');
-        const gymId = gymPart.split(':')[1];
+        const reference = payment.body.external_reference;
+        const [gymPart, planPart, refPart] = reference.split('|');
+        const gimnasioId = gymPart.split(':')[1];
         const planId = planPart.split(':')[1];
         const referidoDe = refPart?.split(':')[1] || null;
 
-        const gymRef = db.collection('gimnasios').doc(gymId);
+        const gymRef = db.collection('gimnasios').doc(gimnasioId);
         const licenciaRef = gymRef.collection('licencia').doc('datos');
 
         await db.runTransaction(async (transaction) => {
-            const planSnap = await db.collection('planesLicencia').doc(planId).get();
-            if (!planSnap.exists) throw new Error("Plan no encontrado");
+            const planDoc = await db.collection('planesLicencia').doc(planId).get();
+            if (!planDoc.exists) throw new Error('Plan inexistente');
 
-            const duracion = planSnap.data().duracion || 30;
-            const planNombre = planSnap.data().nombre || planId;
-            const montoOriginal = planSnap.data().precio;
+            const plan = planDoc.data();
+            const duracion = plan.duracion || 30;
+            const montoOriginal = plan.precio;
+            const planNombre = plan.nombre || planId;
+
+            const now = new Date();
+            let fechaInicio = now;
 
             const licenciaSnap = await transaction.get(licenciaRef);
-            const fechaActual = new Date();
-
-            let fechaInicio = fechaActual;
             if (licenciaSnap.exists) {
-                const vencimiento = licenciaSnap.data().fechaVencimiento?.toDate();
-                if (vencimiento && vencimiento > fechaActual) {
-                    fechaInicio = vencimiento;
-                }
+                const vencimientoActual = licenciaSnap.get('fechaVencimiento')?.toDate?.() || now;
+                if (vencimientoActual > now) fechaInicio = vencimientoActual;
             }
 
             const nuevaVencimiento = new Date(fechaInicio);
@@ -125,14 +118,13 @@ app.post('/webhook', async (req, res) => {
             });
 
             if (referidoDe) {
-                const refDoc = db.collection('referidos').doc(referidoDe);
-                transaction.update(refDoc, {
+                transaction.set(db.collection('referidos').doc(referidoDe), {
                     descuentoAcumulado: admin.firestore.FieldValue.increment(descuentoAplicado)
-                });
+                }, { merge: true });
             }
         });
 
-        await admin.messaging().sendToTopic(gymId, {
+        await admin.messaging().sendToTopic(gimnasioId, {
             notification: {
                 title: '🎉 ¡Licencia Renovada!',
                 body: `Tu plan ${planId} está activo hasta ${new Date().toLocaleDateString()}`
