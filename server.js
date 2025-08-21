@@ -27,17 +27,15 @@ mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 function normalize(s) {
   return (s || '').toString().trim().toLowerCase();
 }
-
 function nowTs() {
   return FieldValue.serverTimestamp();
 }
-
 async function getGymIntegration(gymId) {
   const snap = await db.doc(`gimnasios/${gymId}/integraciones/mp`).get();
   return snap.exists ? snap.data() : null;
 }
 
-// --- OAuth helpers (fetch nativo) ---
+// --- OAuth helpers (fetch nativo de Node 18+ / 20+ / 22+) ---
 async function mpOAuthTokenExchange({ code, redirectUri }) {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -79,7 +77,7 @@ async function mpGetUserMe(accessToken) {
   return resp.json();
 }
 
-// Devuelve un access_token válido del gym (refresca si venció)
+// Devuelve un access_token válido del gym (refresca si va a vencer)
 async function getValidGymAccessToken(gymId) {
   const ref = db.doc(`gimnasios/${gymId}/integraciones/mp`);
   const snap = await ref.get();
@@ -88,7 +86,7 @@ async function getValidGymAccessToken(gymId) {
   const data = snap.data() || {};
   let { access_token, refresh_token, expires_at } = data;
 
-  const soon = Date.now() + 60 * 1000; // 60s margen
+  const soon = Date.now() + 60 * 1000; // margen 60s
   if (!access_token || !expires_at || expires_at <= soon) {
     if (!refresh_token) throw new Error('No hay refresh_token para renovar');
     const tokenJson = await mpOAuthRefresh(refresh_token);
@@ -205,7 +203,7 @@ app.post('/webhook', async (req, res) => {
 
       transaction.set(gymRef.collection('transacciones').doc(paymentId), {
         monto: montoPagado,
-        fecha: FieldValue.serverTimestamp(),
+        fecha: nowTs(),
         metodo: payment.body.payment_type_id,
         referidoDe,
         descuentoAplicado,
@@ -214,7 +212,7 @@ app.post('/webhook', async (req, res) => {
       });
 
       transaction.set(gymRef.collection('licenciaHistorial').doc(), {
-        fecha: FieldValue.serverTimestamp(),
+        fecha: nowTs(),
         plan: planId,
         referidoDe,
         descuentoAplicado,
@@ -247,7 +245,7 @@ app.post('/webhook', async (req, res) => {
 //  OAUTH MERCADO PAGO (gimnasios)
 // ==============================
 
-// Opcional: iniciar OAuth desde navegador
+// Iniciar OAuth (ruta “oficial”)
 app.get('/mp/oauth/start', (req, res) => {
   const gymId = req.query.gymId || 'na';
   const clientId = process.env.MP_CLIENT_ID;
@@ -263,8 +261,15 @@ app.get('/mp/oauth/start', (req, res) => {
   res.redirect(`https://auth.mercadopago.com/authorization?${q.toString()}`);
 });
 
+// Alias para compatibilidad: /oauth/start → /mp/oauth/start
+app.get('/oauth/start', (req, res) => {
+  const url = new URL(`${req.protocol}://${req.get('host')}/mp/oauth/start`);
+  if (req.query.gymId) url.searchParams.set('gymId', req.query.gymId);
+  res.redirect(url.toString());
+});
+
 // Callback OAuth — guarda tokens del gym
-app.get('/mp/oauth/callback', async (req, res) => {
+async function handleOauthCallback(req, res) {
   try {
     const code = req.query.code;
     const gymId = req.query.state;
@@ -289,7 +294,7 @@ app.get('/mp/oauth/callback', async (req, res) => {
       refresh_token: refreshToken,
       token_type: tokenJson.token_type || 'bearer',
       scope: tokenJson.scope || null,
-      expires_at: expiresAt,
+      expires_at: expiresAt, // número (ms)
       seller_id: sellerId,
       seller_nickname: sellerNickname,
       updated_at: nowTs()
@@ -304,7 +309,11 @@ app.get('/mp/oauth/callback', async (req, res) => {
     console.error('OAuth callback error:', e);
     res.status(500).send('Error en OAuth callback');
   }
-});
+}
+
+app.get('/mp/oauth/callback', handleOauthCallback);
+// Alias para compatibilidad: /oauth/callback
+app.get('/oauth/callback', handleOauthCallback);
 
 // Refresh manual (opcional)
 app.post('/mp/oauth/refresh/:gymId', async (req, res) => {
@@ -364,12 +373,10 @@ app.post('/store/orders', async (req, res) => {
       if (!snap.exists) return res.status(404).json({ error: `Producto ${productId} no encontrado` });
       const p = snap.data() || {};
 
-      // precio (si hay oferta, la tomamos; si no, Precio)
       const price = (p.PrecioOferta ?? p.Precio ?? 0);
       const cantidad = Number(quantity);
       if (price <= 0 || cantidad <= 0) return res.status(400).json({ error: 'Precio/cantidad inválida' });
 
-      // No descontamos stock acá; solo validamos existencia bruta (opcional)
       validated.push({
         categoriaId, subcategoriaId, productId,
         nombre: p.Nombre || 'Producto',
@@ -471,12 +478,10 @@ app.post('/store/orders/:orderId/mark-paid-manual', async (req, res) => {
       const order = snap.data();
       if (order.status === 'paid') return; // idempotente
 
-      // Descuento de stock
       for (const it of order.items || []) {
         await discountStockTx(tx, gimnasioId, it);
       }
 
-      // Marcar pagado
       tx.set(orderRef, {
         status: 'paid',
         paidAt: nowTs(),
@@ -484,7 +489,6 @@ app.post('/store/orders/:orderId/mark-paid-manual', async (req, res) => {
         updatedAt: nowTs()
       }, { merge: true });
 
-      // Registrar transacción
       const txRef = db.collection(`gimnasios/${gimnasioId}/transacciones`).doc();
       tx.set(txRef, {
         monto: order.total,
@@ -513,12 +517,11 @@ app.post('/webhook-store', async (req, res) => {
     console.log('📩 Webhook Store:', { gymId, orderId, topic, paymentId });
 
     if (!gymId || !orderId || !paymentId) {
-      return res.status(200).send('OK'); // no reintentes
+      return res.status(200).send('OK');
     }
 
     const gymToken = await getValidGymAccessToken(gymId);
 
-    // Obtener pago del vendedor (GYM)
     const payResp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${gymToken}` }
     });
@@ -531,12 +534,10 @@ app.post('/webhook-store', async (req, res) => {
 
     const orderRef = db.doc(`gimnasios/${gymId}/tienda_ordenes/${orderId}`);
 
-    // Idempotencia: si ya está paid, salimos
     const prev = await orderRef.get();
     if (!prev.exists) return res.status(200).send('OK');
     if (prev.data().status === 'paid') return res.status(200).send('OK');
 
-    // Descontar stock y marcar pagado en TX
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(orderRef);
       if (!snap.exists) return;
@@ -569,7 +570,7 @@ app.post('/webhook-store', async (req, res) => {
     res.status(200).send('OK');
   } catch (e) {
     console.error('webhook-store error:', e);
-    res.status(200).send('OK'); // responder 200 para que MP no bombardee reintentos
+    res.status(200).send('OK');
   }
 });
 
@@ -586,7 +587,6 @@ async function discountStockTx(tx, gimnasioId, it) {
   const qty = Number(quantity || 0);
   if (!qty || qty <= 0) return;
 
-  // Con variantes
   if (Array.isArray(p.StockPorVariante) && p.StockPorVariante.length > 0 && variant) {
     const col = normalize(variant.Color);
     const tal = normalize(variant.Talle);
@@ -612,12 +612,10 @@ async function discountStockTx(tx, gimnasioId, it) {
     }
 
     if (!found) throw new Error('Variante no encontrada para descontar');
-
     tx.set(pRef, { StockPorVariante: list, UpdatedAt: nowTs() }, { merge: true });
     return;
   }
 
-  // Sin variantes → Stock simple
   const stock = Number(p.Stock || 0);
   if (stock < qty) throw new Error('Stock insuficiente');
   tx.set(pRef, { Stock: stock - qty, UpdatedAt: nowTs() }, { merge: true });
