@@ -22,8 +22,7 @@ const FieldValue = admin.firestore.FieldValue;
 mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 // ==============================
-//  Helpers generales
-// ==============================
+/*  Helpers generales  */
 function normalize(s) {
   return (s || '').toString().trim().toLowerCase();
 }
@@ -349,6 +348,178 @@ app.post('/mp/oauth/refresh/:gymId', async (req, res) => {
 });
 
 // ==============================
+//  MEMBRESÍAS (altas / renovaciones)
+// ==============================
+
+// Alta de socio “pendiente_pago” (para nuevos desde la app)
+app.post('/memberships/register', async (req, res) => {
+  try {
+    const { gimnasioId, socio } = req.body || {};
+    if (!gimnasioId || !socio || !socio.nombre) {
+      return res.status(400).json({ error: 'Faltan datos (gimnasioId, socio.nombre)' });
+    }
+    // socioId: explícito, DNI o autogenerado
+    const socioId = socio.socioId || socio.dni || db.collection('_ids').doc().id;
+    const ref = db.doc(`gimnasios/${gimnasioId}/socios/${socioId}`);
+
+    await ref.set({
+      socioId,
+      dni: socio.dni || null,
+      nombre: socio.nombre,
+      email: socio.email || null,
+      telefono: socio.telefono || null,
+      estado: 'pendiente_pago',
+      creadoEn: nowTs(),
+      actualizadoEn: nowTs()
+    }, { merge: true });
+
+    res.json({ socioId });
+  } catch (e) {
+    console.error('register socio error:', e);
+    res.status(500).json({ error: 'Error creando socio' });
+  }
+});
+
+// Inicia checkout de membresía (usa token del GYM via OAuth)
+app.post('/memberships/checkout', async (req, res) => {
+  try {
+    const { gimnasioId, socioId, planId } = req.body || {};
+    if (!gimnasioId || !socioId || !planId) {
+      return res.status(400).json({ error: 'Faltan datos (gimnasioId, socioId, planId)' });
+    }
+
+    // Plan del gym o global
+    let planSnap = await db.doc(`gimnasios/${gimnasioId}/planes/${planId}`).get();
+    if (!planSnap.exists) planSnap = await db.doc(`planes/${planId}`).get();
+    if (!planSnap.exists) return res.status(404).json({ error: 'Plan no encontrado' });
+    const plan = planSnap.data() || {};
+    const precio = Number(plan.precio || plan.Precio || 0);
+    if (!precio) return res.status(400).json({ error: 'Plan sin precio' });
+
+    const gymToken = await getValidGymAccessToken(gimnasioId);
+
+    const preference = {
+      items: [{
+        title: `Membresía ${plan.nombre || plan.Nombre || planId}`,
+        unit_price: precio,
+        quantity: 1
+      }],
+      external_reference: `mbr|${gimnasioId}|${socioId}|${planId}`,
+      notification_url: `${process.env.PUBLIC_BASE_URL}/webhook-memberships`,
+      back_urls: {
+        success: `${process.env.PUBLIC_BASE_URL}/memberships/success`,
+        failure: `${process.env.PUBLIC_BASE_URL}/memberships/failure`
+      },
+      auto_return: 'approved'
+    };
+
+    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${gymToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(preference)
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`Crear preferencia membresía falló: ${resp.status} ${t}`);
+    }
+    const pref = await resp.json();
+    res.json({ init_point: pref.init_point, preference_id: pref.id });
+  } catch (e) {
+    console.error('checkout membresía error:', e);
+    res.status(500).json({ error: 'Error iniciando checkout' });
+  }
+});
+
+// Pago manual de membresía (caja física)
+app.post('/memberships/mark-paid-manual', async (req, res) => {
+  try {
+    const { gimnasioId, socioId, planId, metodo } = req.body || {};
+    if (!gimnasioId || !socioId || !planId) {
+      return res.status(400).json({ error: 'Faltan datos (gimnasioId, socioId, planId)' });
+    }
+
+    let planSnap = await db.doc(`gimnasios/${gimnasioId}/planes/${planId}`).get();
+    if (!planSnap.exists) planSnap = await db.doc(`planes/${planId}`).get();
+    if (!planSnap.exists) return res.status(404).json({ error: 'Plan no encontrado' });
+    const plan = planSnap.data() || {};
+    const precio = Number(plan.precio || plan.Precio || 0);
+
+    await extendMembershipTx({
+      gimnasioId, socioId, planId, plan,
+      monto: precio, metodo: metodo || 'manual', paymentId: null
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('mark-paid-manual membresía error:', e);
+    res.status(500).json({ error: 'Error marcando pago manual' });
+  }
+});
+
+// Webhook de MEMBRESÍAS (MP llama con token del vendedor/gym)
+app.post('/webhook-memberships', async (req, res) => {
+  try {
+    const paymentId = req.body?.data?.id;
+    const topic = req.body?.type || req.body?.topic;
+    if (!paymentId) return res.status(200).send('OK');
+
+    // Leer external_reference (con tu token global)
+    let payment = null;
+    try {
+      const p = await mercadopago.payment.get(paymentId);
+      payment = p.body;
+    } catch (e) {
+      console.warn('No pude leer pago con token global:', e?.message);
+      return res.status(200).send('OK');
+    }
+
+    const extRef = payment?.external_reference || '';
+    // Formato: mbr|{gymId}|{socioId}|{planId}
+    if (!extRef.startsWith('mbr|')) return res.status(200).send('OK');
+
+    const [, gymId, socioId, planId] = extRef.split('|');
+    if (!gymId || !socioId || !planId) return res.status(200).send('OK');
+
+    // Confirmar estado con token del GYM
+    const gymToken = await getValidGymAccessToken(gymId);
+    const payResp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: { Authorization: `Bearer ${gymToken}` }
+    });
+    if (!payResp.ok) {
+      console.error('payments get (gym) error:', await payResp.text());
+      return res.status(200).send('OK');
+    }
+    const sellerPayment = await payResp.json();
+    if (sellerPayment.status !== 'approved') return res.status(200).send('OK');
+
+    // Plan
+    let planSnap = await db.doc(`gimnasios/${gymId}/planes/${planId}`).get();
+    if (!planSnap.exists) planSnap = await db.doc(`planes/${planId}`).get();
+    if (!planSnap.exists) return res.status(200).send('OK');
+    const plan = planSnap.data() || {};
+    const monto = Number(sellerPayment.transaction_amount || 0);
+
+    await extendMembershipTx({
+      gimnasioId: gymId,
+      socioId,
+      planId,
+      plan,
+      monto,
+      metodo: sellerPayment.payment_type_id || 'mp',
+      paymentId
+    });
+
+    res.status(200).send('OK');
+  } catch (e) {
+    console.error('webhook-memberships error:', e);
+    res.status(200).send('OK'); // evitar reintentos agresivos
+  }
+});
+
+// ==============================
 //  TIENDA (carrito / checkout / webhook)
 // ==============================
 
@@ -619,6 +790,74 @@ async function discountStockTx(tx, gimnasioId, it) {
   const stock = Number(p.Stock || 0);
   if (stock < qty) throw new Error('Stock insuficiente');
   tx.set(pRef, { Stock: stock - qty, UpdatedAt: nowTs() }, { merge: true });
+}
+
+// ==============================
+//  Helper: extender/crear membresía y contabilidad
+// ==============================
+async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, metodo, paymentId }) {
+  const socioRef = db.doc(`gimnasios/${gimnasioId}/socios/${socioId}`);
+  const txRef   = db.collection(`gimnasios/${gimnasioId}/transacciones`).doc();
+
+  const duracion = Number(plan.duracion || plan.duracionDias || 30);
+  const planNombre = plan.nombre || plan.Nombre || planId;
+
+  await db.runTransaction(async (tx) => {
+    const socioSnap = await tx.get(socioRef);
+
+    const hoy = new Date();
+    let fechaInicio = hoy;
+    if (socioSnap.exists) {
+      const d = socioSnap.data();
+      const v = d?.fechaVencimiento;
+      const venc = v?.toDate?.() || (v ? new Date(v) : null);
+      if (venc && venc > hoy) fechaInicio = venc;
+    }
+    const fechaVenc = new Date(fechaInicio);
+    fechaVenc.setDate(fechaVenc.getDate() + duracion);
+
+    tx.set(socioRef, {
+      estado: 'activo',
+      planActual: planId,
+      planNombre,
+      fechaInicio,
+      fechaVencimiento: fechaVenc,
+      ultimaRenovacion: nowTs()
+    }, { merge: true });
+
+    tx.set(txRef, {
+      tipo: 'membresia',
+      socioId,
+      planId,
+      monto,
+      metodo,
+      paymentId: paymentId || null,
+      fecha: nowTs()
+    });
+
+    // Resumen mensual (AAAA-MM)
+    const ym = new Date();
+    const yyyy = ym.getFullYear();
+    const mm = String(ym.getMonth() + 1).padStart(2, '0');
+    const resumenRef = db.doc(`gimnasios/${gimnasioId}/resumenPagos/${yyyy}-${mm}`);
+
+    const d = socioSnap.exists ? (socioSnap.data() || {}) : {};
+    const clienteNombre = d?.nombre || d?.Nombre || 'socio';
+    const clienteDni    = d?.dni || d?.Dni || null;
+
+    const pagoItem = {
+      clienteDni: clienteDni,
+      clienteNombre: clienteNombre,
+      empleadoDni: metodo === 'manual' ? 'CAJA' : 'MP',
+      fecha: new Date().toISOString(),
+      metodo: metodo || 'mp',
+      monto: Number(monto || 0),
+      plan: planNombre,
+      registradoPor: paymentId ? 'webhook' : 'manual'
+    };
+
+    tx.set(resumenRef, { pagos: admin.firestore.FieldValue.arrayUnion(pagoItem) }, { merge: true });
+  });
 }
 
 // ==============================
