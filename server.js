@@ -22,19 +22,76 @@ const FieldValue = admin.firestore.FieldValue;
 mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 // ==============================
-/*  Helpers generales  */
+//  Helpers generales
+// ==============================
 function normalize(s) {
   return (s || '').toString().trim().toLowerCase();
 }
 function nowTs() {
   return FieldValue.serverTimestamp();
 }
+
+// 🔎 Zona horaria a usar para “cierre de día”
+const BA_TZ = 'America/Argentina/Buenos_Aires';
+
+// ID de día en TZ Buenos Aires (YYYY-MM-DD)
+function dayId(date = new Date(), timeZone = BA_TZ) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date);
+  const y = parts.find(p => p.type === 'year')?.value;
+  const m = parts.find(p => p.type === 'month')?.value;
+  const d = parts.find(p => p.type === 'day')?.value;
+  return `${y}-${m}-${d}`;
+}
+
+function resumenDiaRef(gymId, d = new Date()) {
+  return db.doc(`gimnasios/${gymId}/resumen_dias/${dayId(d, BA_TZ)}`);
+}
+
+// mapea método → 'efectivo' | 'online'
+function medioKeyFrom(method) {
+  const m = normalize(method);
+  if (m === 'efectivo' || m === 'cash') return 'efectivo';
+  return 'online';
+}
+
+/**
+ * Acumula ingreso diario (en transacción):
+ * tipo: 'altas' | 'renovaciones' | 'tienda'
+ * medio: 'efectivo' | 'online'
+ */
+function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
+  const ref = resumenDiaRef(gymId);
+  const init = {
+    fecha: dayId(new Date(), BA_TZ),
+    ingresos: {
+      altas:        { cantidad: 0, total: 0, efectivo: 0, online: 0 },
+      renovaciones: { cantidad: 0, total: 0, efectivo: 0, online: 0 },
+      tienda:       { cantidad: 0, total: 0, efectivo: 0, online: 0 }
+    },
+    gastos: { cantidad: 0, total: 0, efectivo: 0, online: 0 },
+    ultimaActualizacion: nowTs()
+  };
+  tx.set(ref, init, { merge: true });
+  const updates = {
+    [`ingresos.${tipo}.cantidad`]: FieldValue.increment(1),
+    [`ingresos.${tipo}.total`]: FieldValue.increment(Number(monto || 0)),
+    [`ingresos.${tipo}.${medio}`]: FieldValue.increment(Number(monto || 0)),
+    ultimaActualizacion: nowTs()
+  };
+  tx.set(ref, updates, { merge: true });
+}
+
 async function getGymIntegration(gymId) {
   const snap = await db.doc(`gimnasios/${gymId}/integraciones/mp`).get();
   return snap.exists ? snap.data() : null;
 }
 
-// --- OAuth helpers (fetch nativo de Node 18+ / 20+ / 22+) ---
+// --- OAuth helpers (fetch nativo Node 18+) ---
 async function mpOAuthTokenExchange({ code, redirectUri }) {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -668,6 +725,10 @@ app.post('/store/orders/:orderId/mark-paid-manual', async (req, res) => {
         tipo: 'venta_tienda',
         orderId
       });
+
+      // === ACUMULAR RESUMEN DÍA (TIENDA, con TZ BA) ===
+      const medio = medioKeyFrom(metodo || 'manual');
+      acumularIngresoDiarioTx(tx, gimnasioId, 'tienda', Number(order.total || 0), medio);
     });
 
     res.json({ ok: true });
@@ -736,6 +797,10 @@ app.post('/webhook-store', async (req, res) => {
         orderId,
         paymentId
       });
+
+      // === ACUMULAR RESUMEN DÍA (TIENDA, con TZ BA) ===
+      const medio = medioKeyFrom(payment.payment_type_id || 'mp'); // MP => online
+      acumularIngresoDiarioTx(tx, gymId, 'tienda', Number(order.total || 0), medio);
     });
 
     res.status(200).send('OK');
@@ -807,15 +872,20 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
 
     const hoy = new Date();
     let fechaInicio = hoy;
+    let tipoIngreso = 'altas'; // si no tenía vencimiento → ALTA
     if (socioSnap.exists) {
-      const d = socioSnap.data();
+      const d = socioSnap.data() || {};
       const v = d?.fechaVencimiento;
       const venc = v?.toDate?.() || (v ? new Date(v) : null);
-      if (venc && venc > hoy) fechaInicio = venc;
+      if (venc) {
+        tipoIngreso = 'renovaciones';         // ya tenía plan → RENOVACIÓN
+        if (venc > hoy) fechaInicio = venc;   // se encadena
+      }
     }
     const fechaVenc = new Date(fechaInicio);
     fechaVenc.setDate(fechaVenc.getDate() + duracion);
 
+    // 1) Actualizar socio
     tx.set(socioRef, {
       estado: 'activo',
       planActual: planId,
@@ -825,6 +895,7 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
       ultimaRenovacion: nowTs()
     }, { merge: true });
 
+    // 2) Registrar transacción
     tx.set(txRef, {
       tipo: 'membresia',
       socioId,
@@ -835,7 +906,7 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
       fecha: nowTs()
     });
 
-    // Resumen mensual (AAAA-MM)
+    // 3) Resumen mensual (AAAA-MM) — tal cual lo tenías
     const ym = new Date();
     const yyyy = ym.getFullYear();
     const mm = String(ym.getMonth() + 1).padStart(2, '0');
@@ -857,6 +928,10 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
     };
 
     tx.set(resumenRef, { pagos: admin.firestore.FieldValue.arrayUnion(pagoItem) }, { merge: true });
+
+    // 4) === ACUMULAR RESUMEN DÍA (ALTA/RENOVACIÓN, TZ BA) ===
+    const medio = medioKeyFrom(metodo);
+    acumularIngresoDiarioTx(tx, gimnasioId, tipoIngreso, Number(monto || 0), medio);
   });
 }
 
