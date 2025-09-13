@@ -358,21 +358,6 @@ app.post('/webhook', async (req, res) => {
 });
 
 
-    // Notificación push (igual que antes)
-    try {
-      await admin.messaging().sendToTopic(gimnasioId, {
-        notification: { title: '🎉 ¡Licencia Renovada!', body: 'Plan actualizado correctamente' }
-      });
-    } catch {}
-
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('❌ Error en webhook licencias:', error);
-    res.status(500).send('Error procesando pago');
-  }
-});
-
-
 // ==============================
 //  OAUTH MERCADO PAGO (gimnasios)
 // ==============================
@@ -1019,6 +1004,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
 
 
 
