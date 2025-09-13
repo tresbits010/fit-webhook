@@ -222,41 +222,73 @@ app.post('/webhook', async (req, res) => {
 
     const gymRef = db.collection('gimnasios').doc(gimnasioId);
     const licenciaRef = gymRef.collection('licencia').doc('datos');
+    const configRef = db.doc(`gimnasios/${gimnasioId}/config`); // ← documento (no subcolección)
 
     await db.runTransaction(async (transaction) => {
       const planSnap = await db.collection('planesLicencia').doc(planId).get();
       if (!planSnap.exists) throw new Error('Plan no encontrado');
 
-      const plan = planSnap.data();
-      const duracion = plan.duracion || 30;
-      const montoOriginal = plan.precio || 0;
+      const plan = planSnap.data() || {};
+      const duracion = Number(plan.duracion || 30);
+      const montoOriginal = Number(plan.precio || 0);
+      const tier = plan.tier || 'custom';
+
+      // Soporte de módulos: preferimos plan.modulosPlan; si no está, probamos plan.modulos
+      const modulosPlan = (plan.modulosPlan && typeof plan.modulosPlan === 'object')
+        ? plan.modulosPlan
+        : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
+
+      // Límite de usuarios desde el plan (0 = ilimitado)
+      const maxUsuarios = Number(plan.maxUsuarios || 0);
+
       const fechaActual = new Date();
-
       const licenciaSnap = await transaction.get(licenciaRef);
-      let fechaInicio = fechaActual;
 
+      let fechaInicio = fechaActual;
       if (licenciaSnap.exists) {
         const v = licenciaSnap.data().fechaVencimiento;
         const vencimiento = v?.toDate?.() || new Date(v);
         if (vencimiento && vencimiento > fechaActual) fechaInicio = vencimiento;
       }
-
       const fechaVencimiento = new Date(fechaInicio);
       fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
 
-      const montoPagado = payment.body.transaction_amount;
-      const descuentoAplicado = Math.round((1 - (montoPagado / montoOriginal)) * 100);
+      const montoPagado = Number(payment.body.transaction_amount || 0);
+      const descuentoAplicado = (montoOriginal > 0)
+        ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
+        : 0;
 
-      transaction.set(licenciaRef, {
+      // 1) Estado de licencia (fuente de verdad para “✓ CONTRATADO” en la app)
+      const dataLic = {
         estado: 'activa',
         plan: planId,
         planNombre: plan.nombre,
         fechaInicio,
         fechaVencimiento,
         ultimaActualizacion: FieldValue.serverTimestamp(),
-        usoTrial: false
-      }, { merge: true });
+        usoTrial: false,
+      };
+      // guardamos también el tope acá por comodidad (opcional)
+      if (!Number.isNaN(maxUsuarios)) dataLic.licenciaMaxUsuarios = maxUsuarios;
+      if (modulosPlan) dataLic.modulosPlan = modulosPlan;
 
+      transaction.set(licenciaRef, dataLic, { merge: true });
+
+      // 2) Config del gym (cache leída por la app para límites y UI)
+      const dataCfg = {
+        licenciaPlanId: planId,
+        licenciaNombre: plan.nombre,
+        licenciaTier: tier,
+        licenciaPrecio: montoOriginal,
+        licenciaDuracionDias: duracion,
+        licenciaMaxUsuarios: maxUsuarios,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
+
+      transaction.set(configRef, dataCfg, { merge: true });
+
+      // 3) Registro contable
       transaction.set(gymRef.collection('transacciones').doc(paymentId), {
         monto: montoPagado,
         fecha: nowTs(),
@@ -267,6 +299,7 @@ app.post('/webhook', async (req, res) => {
         detalle: `Licencia ${planId} - ${payment.body.description || ''}`
       });
 
+      // 4) Historial de licencias
       transaction.set(gymRef.collection('licenciaHistorial').doc(), {
         fecha: nowTs(),
         plan: planId,
@@ -275,18 +308,17 @@ app.post('/webhook', async (req, res) => {
         montoPagado
       });
 
+      // 5) Referidos (suma % aplicado)
       if (referidoDe) {
         const refDoc = db.collection('referidos').doc(referidoDe);
         transaction.set(refDoc, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
       }
     });
 
+    // Notificación push (igual que antes)
     try {
       await admin.messaging().sendToTopic(gimnasioId, {
-        notification: {
-          title: '🎉 ¡Licencia Renovada!',
-          body: `Plan actualizado correctamente`
-        }
+        notification: { title: '🎉 ¡Licencia Renovada!', body: 'Plan actualizado correctamente' }
       });
     } catch {}
 
@@ -296,6 +328,7 @@ app.post('/webhook', async (req, res) => {
     res.status(500).send('Error procesando pago');
   }
 });
+
 
 // ==============================
 //  OAUTH MERCADO PAGO (gimnasios)
@@ -943,3 +976,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
