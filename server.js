@@ -230,13 +230,21 @@ app.get('/crear-link-pago', async (req, res) => {
     const pct = await getReferralDiscountPctForBuyer(gimnasioId);
     const factor = Math.max(0, 1 - pct / 100);
     const precioConDto = Number((precio * factor).toFixed(2));
+    const discountAmount = Math.max(0, Number((precio - precioConDto).toFixed(2)));
+
+    const titleBase = `Licencia ${datos.nombre || plan}`;
+    const titleConDto = pct > 0 ? `${titleBase} (−${pct}% referidos)` : titleBase;
 
     const preference = {
       items: [{
-        title: `Licencia ${datos.nombre}`,
+        title: titleConDto,
+        description: pct > 0 ? `Incluye descuento por referidos de ${pct}%` : titleBase,
         unit_price: precioConDto,
         quantity: 1
       }],
+      // 👇 Mostrar descuento como línea en el checkout de MP
+      ...(pct > 0 ? { coupon_code: `REFERIDOS_${pct}`, coupon_amount: discountAmount } : {}),
+      statement_descriptor: 'NICHEAS GYM',
       metadata: {
         gimnasioId,
         plan,
@@ -250,14 +258,19 @@ app.get('/crear-link-pago', async (req, res) => {
         failure: `${process.env.PUBLIC_BASE_URL}/failure`
       },
       auto_return: 'approved'
-      // (si tu cuenta MP ya tiene el webhook configurado, no hace falta notification_url aquí)
     };
 
     const result = await mercadopago.preferences.create(preference);
 
     // ➡️ Por defecto REDIRIGIMOS al init_point (mejor UX para el dueño del gym)
     if (format === 'json') {
-      return res.json({ init_point: result.body.init_point, sandbox_init_point: result.body.sandbox_init_point, preference_id: result.body.id, descuento_pct: pct });
+      return res.json({
+        init_point: result.body.init_point,
+        sandbox_init_point: result.body.sandbox_init_point,
+        preference_id: result.body.id,
+        descuento_pct: pct,
+        descuento_monto: discountAmount
+      });
     }
     return res.redirect(302, result.body.init_point);
   } catch (e) {
@@ -958,8 +971,8 @@ async function discountStockTx(tx, gimnasioId, it) {
       const vCol = normalize(v.Color);
       const vTal = normalize(v.Talle);
 
-    const matchColor = col ? vCol === col : !v.Color;
-    const matchTalle = tal ? vTal === tal : !v.Talle;
+      const matchColor = col ? vCol === col : !v.Color;
+      const matchTalle = tal ? vTal === tal : !v.Talle;
 
       if (matchColor && matchTalle) {
         const st = Number(v.Stock || 0);
