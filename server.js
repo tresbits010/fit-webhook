@@ -193,35 +193,73 @@ async function getValidGymAccessToken(gymId) {
 }
 
 // ==============================
+//  REFERIDOS — helpers
+// ==============================
+
+// % de descuento vigente del COMPRADOR por sus referidos (tope 20%)
+async function getReferralDiscountPctForBuyer(gymId) {
+  try {
+    const snap = await db.collection('referidos').doc(gymId).get();
+    const data = snap.exists ? (snap.data() || {}) : {};
+    const usos = Number(data.usosValidos || data.usos || 0);
+    const pct = Math.max(0, Math.min(usos, 20)); // TOPE 20%
+    return pct;
+  } catch {
+    return 0;
+  }
+}
+
+// ==============================
 //  LICENCIAS (tu flujo actual)
 // ==============================
 
 // Crear link de pago de licencia (usa TU cuenta MP)
+// AHORA: aplica descuento por referidos del COMPRADOR y REDIRIGE al checkout.
 app.get('/crear-link-pago', async (req, res) => {
-  const { gimnasioId, plan, ref } = req.query;
+  const { gimnasioId, plan, ref, format } = req.query;
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
 
   try {
     const planDoc = await db.collection('planesLicencia').doc(plan).get();
     if (!planDoc.exists) return res.status(404).send('Plan no encontrado');
 
-    const datos = planDoc.data();
+    const datos = planDoc.data() || {};
+    const precio = Number(datos.precio || 0);
+
+    // 👇 descuento por referidos del comprador (tope 20%)
+    const pct = await getReferralDiscountPctForBuyer(gimnasioId);
+    const factor = Math.max(0, 1 - pct / 100);
+    const precioConDto = Number((precio * factor).toFixed(2));
+
     const preference = {
       items: [{
         title: `Licencia ${datos.nombre}`,
-        unit_price: datos.precio,
+        unit_price: precioConDto,
         quantity: 1
       }],
-      external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}`,
+      metadata: {
+        gimnasioId,
+        plan,
+        ref: ref || null,
+        descuento_pct: pct,
+        precio_original: precio
+      },
+      external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/success`,
         failure: `${process.env.PUBLIC_BASE_URL}/failure`
       },
       auto_return: 'approved'
+      // (si tu cuenta MP ya tiene el webhook configurado, no hace falta notification_url aquí)
     };
 
     const result = await mercadopago.preferences.create(preference);
-    return res.send(result.body.init_point);
+
+    // ➡️ Por defecto REDIRIGIMOS al init_point (mejor UX para el dueño del gym)
+    if (format === 'json') {
+      return res.json({ init_point: result.body.init_point, sandbox_init_point: result.body.sandbox_init_point, preference_id: result.body.id, descuento_pct: pct });
+    }
+    return res.redirect(302, result.body.init_point);
   } catch (e) {
     console.error('Error al generar link:', e);
     return res.status(500).send('Error interno');
@@ -241,10 +279,12 @@ app.post('/webhook', async (req, res) => {
     const extRef = payment.body.external_reference;
     if (!extRef) return res.status(400).send('Falta external_reference');
 
-    const [gymPart, planPart, refPart] = extRef.split('|');
+    // gym:xxx|plan:yyy|ref:zzz|disc:pct
+    const [gymPart, planPart, refPart, discPart] = extRef.split('|');
     const gimnasioId = gymPart.split(':')[1];
     const planId = planPart.split(':')[1];
     const referidoDe = refPart?.split(':')[1] || null;
+    const discPctFromRef = Number((discPart || '').split(':')[1] || 0) || 0;
 
     const gymRef = db.collection('gimnasios').doc(gimnasioId);
     const licenciaRef = gymRef.collection('licencia').doc('datos');
@@ -311,6 +351,13 @@ app.post('/webhook', async (req, res) => {
       };
       if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
 
+      // si viene ref y el gym NO tenía referidoDe, lo dejamos fijo
+      if (referidoDe) {
+        const cfgSnap = await transaction.get(configRef);
+        const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
+        if (!cfgData.referidoDe) dataCfg.referidoDe = referidoDe;
+      }
+
       transaction.set(configRef, dataCfg, { merge: true });
 
       // 3) Registro contable
@@ -333,10 +380,25 @@ app.post('/webhook', async (req, res) => {
         montoPagado
       });
 
-      // 5) Referidos (suma % aplicado)
+      // 5) Referidos — crédito ONE-TIME al referidor (solo primera compra de este gym)
       if (referidoDe) {
-        const refDoc = db.collection('referidos').doc(referidoDe);
-        transaction.set(refDoc, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
+        const refRoot = db.collection('referidos').doc(referidoDe);
+        const creditRef = refRoot.collection('creditos').doc(gimnasioId);
+        const creditSnap = await transaction.get(creditRef);
+
+        if (!creditSnap.exists) {
+          // suma +1 uso válido
+          transaction.set(refRoot, { usosValidos: FieldValue.increment(1) }, { merge: true });
+          // (opcional) acumular % aplicado por sus referidos
+          transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
+
+          transaction.set(creditRef, {
+            gymReferidoId: gimnasioId,
+            firstPaymentId: paymentId,
+            plan: planId,
+            createdAt: nowTs()
+          });
+        }
       }
     });
 
@@ -896,8 +958,8 @@ async function discountStockTx(tx, gimnasioId, it) {
       const vCol = normalize(v.Color);
       const vTal = normalize(v.Talle);
 
-      const matchColor = col ? vCol === col : !v.Color;
-      const matchTalle = tal ? vTal === tal : !v.Talle;
+    const matchColor = col ? vCol === col : !v.Color;
+    const matchTalle = tal ? vTal === tal : !v.Talle;
 
       if (matchColor && matchTalle) {
         const st = Number(v.Stock || 0);
@@ -1004,7 +1066,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
-
-
-
-
