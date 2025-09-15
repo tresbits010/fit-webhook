@@ -7,7 +7,7 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
-
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 // ==============================
 //  Firebase Admin
 // ==============================
@@ -1079,3 +1079,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
