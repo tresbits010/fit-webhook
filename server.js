@@ -205,7 +205,8 @@ async function getReferralDiscountPctForBuyer(gymId) {
 }
 
 // =======================================================
-//  LICENCIAS — Helper central: procesar pago por paymentId
+//  LICENCIAS — procesar pago por paymentId
+//  (SIN encadenar + idempotente + sin duplicados)
 // =======================================================
 async function processLicensePaymentById(paymentId) {
   try {
@@ -226,12 +227,16 @@ async function processLicensePaymentById(paymentId) {
       return { ok: false, reason: 'bad_extref' };
     }
 
-    const gymRef      = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaRef = gymRef.collection('licencia').doc('datos');
-    // ✅ FIX: documento real dentro de la subcolección "config"
-    const configRef   = db.doc(`gimnasios/${gimnasioId}/config/datos`);
+    const gymRef       = db.collection('gimnasios').doc(gimnasioId);
+    const licenciaRef  = gymRef.collection('licencia').doc('datos');
+    const configRef    = db.doc(`gimnasios/${gimnasioId}/config/datos`);
+    const txIdRef      = db.collection('_mp_processed').doc(String(payment.id)); // marca idempotente
 
     await db.runTransaction(async (transaction) => {
+      // ⛑️ idempotencia: si ya procesamos este payment, salimos
+      const already = await transaction.get(txIdRef);
+      if (already.exists) return;
+
       const planSnap = await db.collection('planesLicencia').doc(planId).get();
       if (!planSnap.exists) throw new Error('Plan no encontrado');
 
@@ -246,16 +251,8 @@ async function processLicensePaymentById(paymentId) {
       if (plan.modulosPlan && typeof plan.modulosPlan === 'object') modulosPlan = plan.modulosPlan;
       else if (plan.modulos && typeof plan.modulos === 'object')   modulosPlan = plan.modulos;
 
-      const hoy = new Date();
-      const licSnap = await transaction.get(licenciaRef);
-      let   fechaInicio = hoy;
-
-      if (licSnap.exists) {
-        const v = licSnap.data().fechaVencimiento;
-        const venc = v?.toDate?.() || (v ? new Date(v) : null);
-        if (venc && venc > hoy) fechaInicio = venc; // encadena días si había vigente
-      }
-
+      // ✅ SIN ENCADENAR: siempre desde ahora
+      const fechaInicio = new Date();
       const fechaVencimiento = new Date(fechaInicio);
       fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
 
@@ -299,7 +296,7 @@ async function processLicensePaymentById(paymentId) {
       }
       transaction.set(configRef, dataCfg, { merge: true });
 
-      // 3) contable
+      // 3) contable (idempotente por payment.id)
       transaction.set(gymRef.collection('transacciones').doc(String(payment.id)), {
         monto: montoPagado,
         fecha: nowTs(),
@@ -308,16 +305,16 @@ async function processLicensePaymentById(paymentId) {
         descuentoAplicado,
         tipo: 'licencia',
         detalle: `Licencia ${planId} - ${payment.description || ''}`
-      });
+      }, { merge: true });
 
-      // 4) historial
-      transaction.set(gymRef.collection('licenciaHistorial').doc(), {
+      // 4) historial (idempotente por payment.id) ⟵ FIX duplicados
+      transaction.set(gymRef.collection('licenciaHistorial').doc(String(payment.id)), {
         fecha: nowTs(),
         plan: planId,
         referidoDe,
         descuentoAplicado,
         montoPagado
-      });
+      }, { merge: true });
 
       // 5) referidos (crédito one-time al referidor)
       if (referidoDe) {
@@ -335,6 +332,9 @@ async function processLicensePaymentById(paymentId) {
           });
         }
       }
+
+      // marca de idempotencia (protege todo el bloque)
+      transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
     });
 
     // notificación (no bloquea)
@@ -342,7 +342,7 @@ async function processLicensePaymentById(paymentId) {
       const gymIdFromExt = (payment.external_reference || '').split('|')[0]?.split(':')[1];
       if (gymIdFromExt) {
         admin.messaging().sendToTopic(gymIdFromExt, {
-          notification: { title: '🎉 ¡Licencia Renovada!', body: `Plan activado correctamente` }
+          notification: { title: '🎉 ¡Licencia activada!', body: `Plan ${payment.description || ''}` }
         }).catch(()=>{});
       }
     } catch {}
@@ -433,17 +433,16 @@ app.post('/webhook', async (req, res) => {
 
     // MP a veces manda: { topic: 'merchant_order', resource: '.../merchant_orders/{id}' }
     if (!paymentId && (topic === 'merchant_order' || req.body?.resource)) {
-      // 1) sacar merchant_order_id
-      let moId = null;
       const resUrl = req.body?.resource || '';
       const m = /merchant_orders\/(\d+)/.exec(resUrl);
-      if (m) moId = m[1];
+      const moId = m ? m[1] : null;
 
-      // 2) pedir la orden y tomar el primer pago approved
       if (moId) {
         try {
           const ord = await mercadopago.merchant_orders.get(moId);
-          const pay = (ord?.body?.payments || []).find(p => p?.id) || null;
+          const payments = ord?.body?.payments || [];
+          // preferimos el aprobado
+          const pay = payments.find(p => p?.status === 'approved') || payments[0] || null;
           if (pay?.id) paymentId = String(pay.id);
         } catch (e) {
           console.warn('merchant_order lookup error:', e?.message);
@@ -452,7 +451,6 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (!paymentId) return res.status(200).send('OK'); // idempotente
-
     const r = await processLicensePaymentById(String(paymentId));
     console.log('webhook result:', r);
     return res.status(200).send('OK');
@@ -469,7 +467,7 @@ function successHtml(msg) {
 app.get(['/success','/exito','/éxito'], async (req, res) => {
   try {
     const paymentId = req.query.payment_id || req.query.collection_id || null;
-    if (paymentId) await processLicensePaymentById(String(paymentId));
+    if (paymentId) await processLicensePaymentById(String(paymentId)); // idempotente
     return res.status(200).send(successHtml('Pago aprobado ✅'));
   } catch {
     return res.status(200).send(successHtml('Pago recibido (procesando)'));
@@ -504,7 +502,7 @@ app.get('/oauth/start', (req, res) => {
 async function handleOauthCallback(req, res) {
   try {
     const code = req.query.code;
-    const gymId = req.query.state;
+       const gymId = req.query.state;
     if (!code || !gymId) return res.status(400).send('Faltan code/state');
 
     const tokenJson = await mpOAuthTokenExchange({ code, redirectUri: process.env.MP_REDIRECT_URI });
@@ -1099,4 +1097,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
-
