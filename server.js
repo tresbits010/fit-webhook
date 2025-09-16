@@ -1,6 +1,6 @@
 // server.js
 const express = require('express');
-const mercadopago = require('mercadopago'); // MP para LICENCIAS (tu cuenta)
+const mercadopago = require('mercadopago'); // para LICENCIAS (tu cuenta)
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
 dotenv.config();
@@ -22,56 +22,48 @@ const FieldValue = admin.firestore.FieldValue;
 mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 // ==============================
-//  Landing pages (redir de MP)
-// ==============================
-app.get(['/', '/ok'], (req, res) => res.send('OK'));
-app.get(['/success','/exito','/éxito'], (req, res) => {
-  res.set('Content-Type','text/html; charset=utf-8');
-  res.send(`<!doctype html><meta charset="utf-8">
-  <title>Pago aprobado</title><style>body{font-family:sans-serif;padding:2rem}</style>
-  <h2>✅ Pago aprobado</h2><p>Podés cerrar esta pestaña y volver a la app.</p>`);
-});
-app.get(['/failure','/fallo','/error'], (req, res) => {
-  res.set('Content-Type','text/html; charset=utf-8');
-  res.send(`<!doctype html><meta charset="utf-8">
-  <title>Pago no aprobado</title><style>body{font-family:sans-serif;padding:2rem}</style>
-  <h2>❌ Pago no aprobado</h2><p>Si ya se debitó, esperá unos minutos o contactanos.</p>`);
-});
-app.get(['/pending','/pendiente'], (req, res) => {
-  res.set('Content-Type','text/html; charset=utf-8');
-  res.send(`<!doctype html><meta charset="utf-8">
-  <title>Pago pendiente</title><style>body{font-family:sans-serif;padding:2rem}</style>
-  <h2>⏳ Pago pendiente</h2><p>Te avisaremos cuando se acredite.</p>`);
-});
-
-// ==============================
 //  Helpers generales
 // ==============================
-function normalize(s) { return (s || '').toString().trim().toLowerCase(); }
-function nowTs() { return FieldValue.serverTimestamp(); }
+function normalize(s) {
+  return (s || '').toString().trim().toLowerCase();
+}
+function nowTs() {
+  return FieldValue.serverTimestamp();
+}
 
-// 🔎 Zona horaria para “cierre de día”
+// 🔎 Zona horaria a usar para “cierre de día”
 const BA_TZ = 'America/Argentina/Buenos_Aires';
 
 // ID de día en TZ Buenos Aires (YYYY-MM-DD)
 function dayId(date = new Date(), timeZone = BA_TZ) {
   const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
   }).formatToParts(date);
   const y = parts.find(p => p.type === 'year')?.value;
   const m = parts.find(p => p.type === 'month')?.value;
   const d = parts.find(p => p.type === 'day')?.value;
   return `${y}-${m}-${d}`;
 }
+
 function resumenDiaRef(gymId, d = new Date()) {
   return db.doc(`gimnasios/${gymId}/resumen_dias/${dayId(d, BA_TZ)}`);
 }
+
+// mapea método → 'efectivo' | 'online'
 function medioKeyFrom(method) {
   const m = normalize(method);
   if (m === 'efectivo' || m === 'cash') return 'efectivo';
   return 'online';
 }
-/** Acumula ingreso diario (en transacción) */
+
+/**
+ * Acumula ingreso diario (en transacción):
+ * tipo: 'altas' | 'renovaciones' | 'tienda'
+ * medio: 'efectivo' | 'online'
+ */
 function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
   const ref = resumenDiaRef(gymId);
   const init = {
@@ -85,15 +77,16 @@ function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
     ultimaActualizacion: nowTs()
   };
   tx.set(ref, init, { merge: true });
-  tx.set(ref, {
+  const updates = {
     [`ingresos.${tipo}.cantidad`]: FieldValue.increment(1),
     [`ingresos.${tipo}.total`]: FieldValue.increment(Number(monto || 0)),
     [`ingresos.${tipo}.${medio}`]: FieldValue.increment(Number(monto || 0)),
     ultimaActualizacion: nowTs()
-  }, { merge: true });
+  };
+  tx.set(ref, updates, { merge: true });
 }
 
-// Normaliza módulos de plan → array legible
+// (por si lo usás en otro lado)
 function extractPlanModules(plan = {}) {
   const out = new Set();
   const candidates = ['modulosPlan', 'modulos', 'modules', 'features'];
@@ -127,14 +120,18 @@ async function mpOAuthTokenExchange({ code, redirectUri }) {
     grant_type: 'authorization_code',
     client_id: process.env.MP_CLIENT_ID,
     client_secret: process.env.MP_CLIENT_SECRET,
-    code, redirect_uri: redirectUri
+    code,
+    redirect_uri: redirectUri
   });
   const resp = await fetch('https://api.mercadopago.com/oauth/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
   });
   if (!resp.ok) throw new Error(`OAuth exchange failed: ${resp.status} ${await resp.text()}`);
   return resp.json();
 }
+
 async function mpOAuthRefresh(refreshToken) {
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -143,11 +140,14 @@ async function mpOAuthRefresh(refreshToken) {
     refresh_token: refreshToken
   });
   const resp = await fetch('https://api.mercadopago.com/oauth/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
   });
   if (!resp.ok) throw new Error(`OAuth refresh failed: ${resp.status} ${await resp.text()}`);
   return resp.json();
 }
+
 async function mpGetUserMe(accessToken) {
   const resp = await fetch('https://api.mercadopago.com/users/me', {
     headers: { Authorization: `Bearer ${accessToken}` }
@@ -155,6 +155,7 @@ async function mpGetUserMe(accessToken) {
   if (!resp.ok) throw new Error(`users/me failed: ${resp.status} ${await resp.text()}`);
   return resp.json();
 }
+
 // Devuelve un access_token válido del gym (refresca si va a vencer)
 async function getValidGymAccessToken(gymId) {
   const ref = db.doc(`gimnasios/${gymId}/integraciones/mp`);
@@ -173,12 +174,17 @@ async function getValidGymAccessToken(gymId) {
     const expiresIn = Number(tokenJson.expires_in || 0);
     expires_at = Date.now() + expiresIn * 1000;
 
-    await ref.set({
-      access_token, refresh_token, expires_at,
-      token_type: tokenJson.token_type || 'bearer',
-      scope: tokenJson.scope || data.scope || null,
-      updated_at: nowTs()
-    }, { merge: true });
+    await ref.set(
+      {
+        access_token,
+        refresh_token,
+        expires_at,
+        token_type: tokenJson.token_type || 'bearer',
+        scope: tokenJson.scope || data.scope || null,
+        updated_at: nowTs()
+      },
+      { merge: true }
+    );
   }
   return access_token;
 }
@@ -191,62 +197,220 @@ async function getReferralDiscountPctForBuyer(gymId) {
     const snap = await db.collection('referidos').doc(gymId).get();
     const data = snap.exists ? (snap.data() || {}) : {};
     const usos = Number(data.usosValidos || data.usos || 0);
-    return Math.max(0, Math.min(usos, 20)); // TOPE 20%
-  } catch { return 0; }
+    const pct = Math.max(0, Math.min(usos, 20)); // TOPE 20%
+    return pct;
+  } catch {
+    return 0;
+  }
+}
+
+// =======================================================
+//  LICENCIAS — Helper central: procesar pago por paymentId
+// =======================================================
+async function processLicensePaymentById(paymentId) {
+  try {
+    const { body: payment } = await mercadopago.payment.get(paymentId);
+    if (!payment || payment.status !== 'approved') {
+      return { ok: false, reason: 'not_approved' };
+    }
+
+    const extRef = payment.external_reference || '';
+    // Formato esperado: gym:{gymId}|plan:{planId}|ref:{referidor?}|disc:{pct}
+    const [gymPart, planPart, refPart] = extRef.split('|');
+    const gimnasioId = gymPart?.split(':')[1];
+    const planId     = planPart?.split(':')[1];
+    const referidoDe = refPart?.split(':')[1] || null;
+
+    if (!gimnasioId || !planId) {
+      console.warn('external_reference inesperado:', extRef);
+      return { ok: false, reason: 'bad_extref' };
+    }
+
+    const gymRef      = db.collection('gimnasios').doc(gimnasioId);
+    const licenciaRef = gymRef.collection('licencia').doc('datos');
+    const configRef   = db.doc(`gimnasios/${gimnasioId}/config`);
+
+    await db.runTransaction(async (transaction) => {
+      const planSnap = await db.collection('planesLicencia').doc(planId).get();
+      if (!planSnap.exists) throw new Error('Plan no encontrado');
+
+      const plan = planSnap.data() || {};
+      const duracion      = Number(plan.duracion || 30);
+      const montoOriginal = Number(plan.precio || 0);
+      const tier          = plan.tier || 'custom';
+
+      // módulos (objeto o array admitidos)
+      const modulosPlan = (plan.modulosPlan && typeof plan.modulosPlan === 'object')
+        ? plan.modulosPlan
+        : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
+
+      const maxUsuarios = Number(plan.maxUsuarios || 0);
+
+      const fechaActual  = new Date();
+      const licSnap      = await transaction.get(licenciaRef);
+      let   fechaInicio  = fechaActual;
+
+      if (licSnap.exists) {
+        const v = licSnap.data().fechaVencimiento;
+        const venc = v?.toDate?.() || new Date(v);
+        if (venc && venc > fechaActual) fechaInicio = venc; // encadena días
+      }
+
+      const fechaVencimiento = new Date(fechaInicio);
+      fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
+
+      const montoPagado = Number(payment.transaction_amount || 0);
+      const descuentoAplicado = (montoOriginal > 0)
+        ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
+        : 0;
+
+      // 1) licencia/datos (fuente de verdad)
+      const dataLic = {
+        estado: 'activa',
+        plan: planId,
+        planNombre: plan.nombre,
+        fechaInicio,
+        fechaVencimiento,
+        ultimaActualizacion: FieldValue.serverTimestamp(),
+        usoTrial: false
+      };
+      if (!Number.isNaN(maxUsuarios)) dataLic.licenciaMaxUsuarios = maxUsuarios;
+      if (modulosPlan) dataLic.modulosPlan = modulosPlan;
+
+      transaction.set(licenciaRef, dataLic, { merge: true });
+
+      // 2) config (cache para clientes)
+      const dataCfg = {
+        licenciaPlanId: planId,
+        licenciaNombre: plan.nombre,
+        licenciaTier: tier,
+        licenciaPrecio: montoOriginal,
+        licenciaDuracionDias: duracion,
+        licenciaMaxUsuarios: maxUsuarios,
+        updatedAt: FieldValue.serverTimestamp()
+      };
+      if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
+
+      if (referidoDe) {
+        const cfgSnap = await transaction.get(configRef);
+        const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
+        if (!cfgData.referidoDe) dataCfg.referidoDe = referidoDe;
+      }
+      transaction.set(configRef, dataCfg, { merge: true });
+
+      // 3) contable
+      transaction.set(gymRef.collection('transacciones').doc(String(payment.id)), {
+        monto: montoPagado,
+        fecha: nowTs(),
+        metodo: payment.payment_type_id,
+        referidoDe,
+        descuentoAplicado,
+        tipo: 'licencia',
+        detalle: `Licencia ${planId} - ${payment.description || ''}`
+      });
+
+      // 4) historial
+      transaction.set(gymRef.collection('licenciaHistorial').doc(), {
+        fecha: nowTs(),
+        plan: planId,
+        referidoDe,
+        descuentoAplicado,
+        montoPagado
+      });
+
+      // 5) referidos (crédito one-time)
+      if (referidoDe) {
+        const refRoot   = db.collection('referidos').doc(referidoDe);
+        const creditRef = refRoot.collection('creditos').doc(gimnasioId);
+        const creditSnap= await transaction.get(creditRef);
+        if (!creditSnap.exists) {
+          transaction.set(refRoot, { usosValidos: FieldValue.increment(1) }, { merge: true });
+          transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
+          transaction.set(creditRef, {
+            gymReferidoId: gimnasioId,
+            firstPaymentId: String(payment.id),
+            plan: planId,
+            createdAt: nowTs()
+          });
+        }
+      }
+    });
+
+    // notificación (no bloquea)
+    try {
+      const gymIdFromExt = (payment.external_reference || '').split('|')[0]?.split(':')[1];
+      if (gymIdFromExt) {
+        admin.messaging().sendToTopic(gymIdFromExt, {
+          notification: { title: '🎉 ¡Licencia Renovada!', body: `Plan activado correctamente` }
+        }).catch(()=>{});
+      }
+    } catch {}
+
+    return { ok: true };
+  } catch (e) {
+    console.error('processLicensePaymentById error:', e);
+    return { ok: false, reason: 'exception', error: e?.message };
+  }
 }
 
 // ==============================
-//  LICENCIAS (creación & webhook)
+//  LICENCIAS — crear preferencia
 // ==============================
 app.get('/crear-link-pago', async (req, res) => {
   const { gimnasioId, plan, ref, format } = req.query;
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
+
   try {
     const planDoc = await db.collection('planesLicencia').doc(plan).get();
     if (!planDoc.exists) return res.status(404).send('Plan no encontrado');
 
-    const datos = planDoc.data() || {};
+    const datos  = planDoc.data() || {};
     const precio = Number(datos.precio || 0);
 
-    const pct = await getReferralDiscountPctForBuyer(gimnasioId);
-    const factor = Math.max(0, 1 - pct / 100);
+    // descuento por referidos del COMPRADOR (tope 20%)
+    const pct          = await getReferralDiscountPctForBuyer(gimnasioId);
+    const factor       = Math.max(0, 1 - pct / 100);
     const precioConDto = Number((precio * factor).toFixed(2));
-    const discountAmount = Math.max(0, Number((precio - precioConDto).toFixed(2)));
+    const discountAmt  = Math.max(0, Number((precio - precioConDto).toFixed(2)));
 
-    const titleBase = `Licencia ${datos.nombre || plan}`;
-    const titleConDto = pct > 0 ? `${titleBase} (−${pct}% referidos)` : titleBase;
+    const titleBase  = `Licencia ${datos.nombre || plan}`;
+    const titleConDto= pct > 0 ? `${titleBase} (−${pct}% referidos)` : titleBase;
 
     const preference = {
       items: [{
         title: titleConDto,
         description: pct > 0 ? `Incluye descuento por referidos de ${pct}%` : titleBase,
-        unit_price: precioConDto, quantity: 1
+        unit_price: precioConDto,
+        quantity: 1
       }],
-      ...(pct > 0 ? { coupon_code: `REFERIDOS_${pct}`, coupon_amount: discountAmount } : {}),
+      ...(pct > 0 ? { coupon_code: `REFERIDOS_${pct}`, coupon_amount: discountAmt } : {}),
       statement_descriptor: 'NICHEAS GYM',
       metadata: {
-        gimnasioId, plan, ref: ref || null,
-        descuento_pct: pct, precio_original: precio
+        gimnasioId, plan,
+        ref: ref || null,
+        descuento_pct: pct,
+        precio_original: precio
       },
       external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
+      // 🔔 IMPORTANTE: para que MP llame a nuestro webhook
+      notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/success`,
         failure: `${process.env.PUBLIC_BASE_URL}/failure`,
         pending: `${process.env.PUBLIC_BASE_URL}/pending`
       },
-      auto_return: 'approved',
-      // 👇 importante: asegura que MP pegue a tu servidor
-      notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`
+      auto_return: 'approved'
     };
 
     const result = await mercadopago.preferences.create(preference);
+
     if (format === 'json') {
       return res.json({
         init_point: result.body.init_point,
         sandbox_init_point: result.body.sandbox_init_point,
         preference_id: result.body.id,
         descuento_pct: pct,
-        descuento_monto: discountAmount
+        descuento_monto: discountAmt
       });
     }
     return res.redirect(302, result.body.init_point);
@@ -256,134 +420,40 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
-// Webhook de LICENCIAS (usa TU token global)
+// ==============================
+//  LICENCIAS — Webhook + páginas de retorno (fallback)
+// ==============================
 app.post('/webhook', async (req, res) => {
   try {
-    console.log('📩 Webhook Licencias:', JSON.stringify(req.body, null, 2));
-    const paymentId = req.body?.data?.id;
-    if (!paymentId) return res.status(400).send('Sin ID de pago');
+    console.log('📩 Webhook Licencias:', JSON.stringify(req.body));
+    const paymentId = req.body?.data?.id || req.body?.id;
+    if (!paymentId) return res.status(200).send('OK'); // idempotente
 
-    const payment = await mercadopago.payment.get(paymentId);
-    if (payment.body.status !== 'approved') return res.status(200).send('Pago no aprobado');
-
-    const extRef = payment.body.external_reference;
-    if (!extRef) return res.status(400).send('Falta external_reference');
-
-    // gym:xxx|plan:yyy|ref:zzz|disc:pct
-    const [gymPart, planPart, refPart, discPart] = extRef.split('|');
-    const gimnasioId = gymPart.split(':')[1];
-    const planId = planPart.split(':')[1];
-    const referidoDe = refPart?.split(':')[1] || null;
-
-    const gymRef = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaRef = gymRef.collection('licencia').doc('datos');
-    const configRef = db.doc(`gimnasios/${gimnasioId}/config`);
-
-    await db.runTransaction(async (transaction) => {
-      const planSnap = await db.collection('planesLicencia').doc(planId).get();
-      if (!planSnap.exists) throw new Error('Plan no encontrado');
-
-      const plan = planSnap.data() || {};
-      const duracion = Number(plan.duracion || 30);
-      const montoOriginal = Number(plan.precio || 0);
-      const tier = plan.tier || 'custom';
-
-      // módulos del plan (objeto) + array friendly
-      const modulosPlanObj =
-        (plan.modulosPlan && typeof plan.modulosPlan === 'object')
-          ? plan.modulosPlan
-          : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
-      const modulosHabilitados = extractPlanModules(plan);
-
-      const maxUsuarios = Number(plan.maxUsuarios || 0); // 0 = ilimitado
-
-      const fechaActual = new Date();
-      const licSnap = await transaction.get(licenciaRef);
-
-      // encadenar si aún vigente
-      let fechaInicio = fechaActual;
-      if (licSnap.exists) {
-        const v = licSnap.data().fechaVencimiento;
-        const vencimiento = v?.toDate?.() || new Date(v);
-        if (vencimiento && vencimiento > fechaActual) fechaInicio = vencimiento;
-      }
-      const fechaVencimiento = new Date(fechaInicio);
-      fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
-
-      const montoPagado = Number(payment.body.transaction_amount || 0);
-      const descuentoAplicado = (montoOriginal > 0)
-        ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
-        : 0;
-
-      // 1) Estado de licencia (fuente de verdad)
-      const dataLic = {
-        estado: 'activa',
-        plan: planId,
-        planNombre: plan.nombre,
-        fechaInicio,
-        fechaVencimiento,
-        ultimaActualizacion: nowTs(),
-        usoTrial: false,
-        licenciaMaxUsuarios: maxUsuarios,
-        licenciaBloqueada: false,                 // 🔓 desbloquea el sistema
-        modulosHabilitados                         // array amigable
-      };
-      if (modulosPlanObj) dataLic.modulosPlan = modulosPlanObj; // objeto original
-      transaction.set(licenciaRef, dataLic, { merge: true });
-
-      // 2) Config del gym (cache para apps)
-      const dataCfg = {
-        licenciaPlanId: planId,
-        licenciaNombre: plan.nombre,
-        licenciaTier: tier,
-        licenciaPrecio: montoOriginal,
-        licenciaDuracionDias: duracion,
-        licenciaMaxUsuarios: maxUsuarios,
-        licenciaBloqueada: false,                 // 🔓
-        modulosHabilitados,
-        updatedAt: nowTs()
-      };
-      if (modulosPlanObj) dataCfg.modulosPlan = modulosPlanObj;
-      // si viene ref y el gym NO tenía referidoDe, lo fijamos
-      if (referidoDe) {
-        const cfgSnap = await transaction.get(configRef);
-        const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-        if (!cfgData.referidoDe) dataCfg.referidoDe = referidoDe;
-      }
-      transaction.set(configRef, dataCfg, { merge: true });
-
-      // 3) Registro contable
-      transaction.set(gymRef.collection('transacciones').doc(paymentId), {
-        monto: montoPagado,
-        fecha: nowTs(),
-        metodo: payment.body.payment_type_id,
-        referidoDe,
-        descuentoAplicado,
-        tipo: 'licencia',
-        detalle: `Licencia ${planId} - ${payment.body.description || ''}`
-      });
-
-      // 4) Historial de licencias
-      transaction.set(gymRef.collection('licenciaHistorial').doc(), {
-        fecha: nowTs(),
-        plan: planId,
-        referidoDe,
-        descuentoAplicado,
-        montoPagado
-      });
-    });
-
-    // 🔔 Notificación push (best-effort)
-    admin.messaging().sendToTopic(gimnasioId, {
-      notification: { title: '🎉 ¡Licencia renovada!', body: `Plan ${planId} activado correctamente` }
-    }).catch(err => console.warn('FCM error:', err?.message));
-
+    const r = await processLicensePaymentById(String(paymentId));
+    console.log('webhook result:', r);
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ Error en webhook licencias:', error);
-    return res.status(500).send('Error procesando pago');
+    return res.status(200).send('OK'); // evitar reintentos agresivos
   }
 });
+
+function successHtml(msg) {
+  return `<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:20px">
+  <h2>${msg}</h2><p>Podés cerrar esta pestaña y volver a la app.</p></body>`;
+}
+app.get(['/success','/exito','/éxito'], async (req, res) => {
+  try {
+    const paymentId = req.query.payment_id || req.query.collection_id || null;
+    if (paymentId) await processLicensePaymentById(String(paymentId));
+    return res.status(200).send(successHtml('Pago aprobado ✅'));
+  } catch {
+    return res.status(200).send(successHtml('Pago recibido (procesando)'));
+  }
+});
+app.get('/failure', (req, res) => res.status(200).send(successHtml('El pago no pudo completarse ❌')));
+app.get('/pending', (req, res) => res.status(200).send(successHtml('Pago pendiente ⏳')));
+app.get(['/','/ok','/health'], (req,res)=> res.send('OK'));
 
 // ==============================
 //  OAUTH MERCADO PAGO (gimnasios)
@@ -393,8 +463,12 @@ app.get('/mp/oauth/start', (req, res) => {
   const clientId = process.env.MP_CLIENT_ID;
   const redirectUri = process.env.MP_REDIRECT_URI;
   if (!clientId || !redirectUri) return res.status(400).send('Faltan MP_CLIENT_ID/MP_REDIRECT_URI');
+
   const q = new URLSearchParams({
-    response_type: 'code', client_id: clientId, redirect_uri: redirectUri, state: gymId
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state: gymId
   });
   res.redirect(`https://auth.mercadopago.com/authorization?${q.toString()}`);
 });
@@ -412,7 +486,8 @@ async function handleOauthCallback(req, res) {
     const tokenJson = await mpOAuthTokenExchange({ code, redirectUri: process.env.MP_REDIRECT_URI });
     const accessToken = tokenJson.access_token;
     const refreshToken = tokenJson.refresh_token;
-    const expiresAt = Date.now() + Number(tokenJson.expires_in || 0) * 1000;
+    const expiresIn = Number(tokenJson.expires_in || 0);
+    const expiresAt = Date.now() + expiresIn * 1000;
 
     let sellerId = tokenJson.user_id || null;
     let sellerNickname = null;
@@ -427,16 +502,17 @@ async function handleOauthCallback(req, res) {
       refresh_token: refreshToken,
       token_type: tokenJson.token_type || 'bearer',
       scope: tokenJson.scope || null,
-      expires_at: expiresAt,
+      expires_at: expiresAt, // número (ms)
       seller_id: sellerId,
       seller_nickname: sellerNickname,
       updated_at: nowTs()
     }, { merge: true });
 
-    res.status(200).send(`<!doctype html><meta charset="utf-8">
-    <style>body{font-family:sans-serif;padding:2rem}</style>
-    <h2>Cuenta de Mercado Pago conectada ✅</h2>
-    <p>Gimnasio: ${gymId}</p><p>Ya podés cerrar esta pestaña.</p>`);
+    res.status(200).send(`<html><body style="font-family:sans-serif">
+      <h2>Cuenta de Mercado Pago conectada ✅</h2>
+      <p>Gimnasio: ${gymId}</p>
+      <p>Ya podés cerrar esta pestaña.</p>
+    </body></html>`);
   } catch (e) {
     console.error('OAuth callback error:', e);
     res.status(500).send('Error en OAuth callback');
@@ -444,20 +520,21 @@ async function handleOauthCallback(req, res) {
 }
 app.get('/mp/oauth/callback', handleOauthCallback);
 app.get('/oauth/callback', handleOauthCallback);
-
 app.post('/mp/oauth/refresh/:gymId', async (req, res) => {
   try {
     const gymId = req.params.gymId;
     const docRef = db.doc(`gimnasios/${gymId}/integraciones/mp`);
     const snap = await docRef.get();
     if (!snap.exists) return res.status(404).json({ error: 'Gym sin integración' });
+
     const data = snap.data() || {};
     if (!data.refresh_token) return res.status(400).json({ error: 'No hay refresh_token' });
 
     const tokenJson = await mpOAuthRefresh(data.refresh_token);
     const accessToken = tokenJson.access_token;
     const newRefresh = tokenJson.refresh_token || data.refresh_token;
-    const expiresAt = Date.now() + Number(tokenJson.expires_in || 0) * 1000;
+    const expiresIn = Number(tokenJson.expires_in || 0);
+    const expiresAt = Date.now() + expiresIn * 1000;
 
     await docRef.set({
       access_token: accessToken,
@@ -522,23 +599,32 @@ app.post('/memberships/checkout', async (req, res) => {
     const gymToken = await getValidGymAccessToken(gimnasioId);
 
     const preference = {
-      items: [{ title: `Membresía ${plan.nombre || plan.Nombre || planId}`, unit_price: precio, quantity: 1 }],
+      items: [{
+        title: `Membresía ${plan.nombre || plan.Nombre || planId}`,
+        unit_price: precio,
+        quantity: 1
+      }],
       external_reference: `mbr|${gimnasioId}|${socioId}|${planId}`,
       notification_url: `${process.env.PUBLIC_BASE_URL}/webhook-memberships`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/memberships/success`,
-        failure: `${process.env.PUBLIC_BASE_URL}/memberships/failure`,
-        pending: `${process.env.PUBLIC_BASE_URL}/pending`
+        failure: `${process.env.PUBLIC_BASE_URL}/memberships/failure`
       },
       auto_return: 'approved'
     };
 
     const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${gymToken}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${gymToken}`,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(preference)
     });
-    if (!resp.ok) throw new Error(`Crear preferencia membresía falló: ${resp.status} ${await resp.text()}`);
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`Crear preferencia membresía falló: ${resp.status} ${t}`);
+    }
     const pref = await resp.json();
     res.json({ init_point: pref.init_point, preference_id: pref.id });
   } catch (e) {
@@ -561,8 +647,8 @@ app.post('/memberships/mark-paid-manual', async (req, res) => {
     const precio = Number(plan.precio || plan.Precio || 0);
 
     await extendMembershipTx({
-      gimnasioId, socioId, planId, plan, monto: precio,
-      metodo: metodo || 'manual', paymentId: null
+      gimnasioId, socioId, planId, plan,
+      monto: precio, metodo: metodo || 'manual', paymentId: null
     });
 
     res.json({ ok: true });
@@ -572,16 +658,21 @@ app.post('/memberships/mark-paid-manual', async (req, res) => {
   }
 });
 
-// Webhook de MEMBRESÍAS (MP con token del vendedor/gym)
 app.post('/webhook-memberships', async (req, res) => {
   try {
     const paymentId = req.body?.data?.id;
+    const topic = req.body?.type || req.body?.topic;
     if (!paymentId) return res.status(200).send('OK');
 
     // Leer external_reference (con tu token global)
     let payment = null;
-    try { payment = (await mercadopago.payment.get(paymentId)).body; }
-    catch { return res.status(200).send('OK'); }
+    try {
+      const p = await mercadopago.payment.get(paymentId);
+      payment = p.body;
+    } catch (e) {
+      console.warn('No pude leer pago con token global:', e?.message);
+      return res.status(200).send('OK');
+    }
 
     const extRef = payment?.external_reference || '';
     if (!extRef.startsWith('mbr|')) return res.status(200).send('OK');
@@ -594,11 +685,13 @@ app.post('/webhook-memberships', async (req, res) => {
     const payResp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${gymToken}` }
     });
-    if (!payResp.ok) return res.status(200).send('OK');
+    if (!payResp.ok) {
+      console.error('payments get (gym) error:', await payResp.text());
+      return res.status(200).send('OK');
+    }
     const sellerPayment = await payResp.json();
     if (sellerPayment.status !== 'approved') return res.status(200).send('OK');
 
-    // Plan
     let planSnap = await db.doc(`gimnasios/${gymId}/planes/${planId}`).get();
     if (!planSnap.exists) planSnap = await db.doc(`planes/${planId}`).get();
     if (!planSnap.exists) return res.status(200).send('OK');
@@ -606,14 +699,19 @@ app.post('/webhook-memberships', async (req, res) => {
     const monto = Number(sellerPayment.transaction_amount || 0);
 
     await extendMembershipTx({
-      gimnasioId: gymId, socioId, planId, plan,
-      monto, metodo: sellerPayment.payment_type_id || 'mp', paymentId
+      gimnasioId: gymId,
+      socioId,
+      planId,
+      plan,
+      monto,
+      metodo: sellerPayment.payment_type_id || 'mp',
+      paymentId
     });
 
     res.status(200).send('OK');
   } catch (e) {
     console.error('webhook-memberships error:', e);
-    res.status(200).send('OK'); // evitar reintentos agresivos
+    res.status(200).send('OK');
   }
 });
 
@@ -629,6 +727,7 @@ app.post('/store/orders', async (req, res) => {
 
     let total = 0;
     const validated = [];
+
     for (const it of items) {
       const { categoriaId, subcategoriaId, productId, quantity, variant } = it || {};
       if (!categoriaId || !subcategoriaId || !productId || !quantity) {
@@ -656,9 +755,14 @@ app.post('/store/orders', async (req, res) => {
 
     const orderRef = db.collection(`gimnasios/${gimnasioId}/tienda_ordenes`).doc();
     const order = {
-      id: orderRef.id, gimnasioId, items: validated, buyer: buyer || null,
-      total: Number(total.toFixed(2)), status: 'pending',
-      createdAt: nowTs(), updatedAt: nowTs()
+      id: orderRef.id,
+      gimnasioId,
+      items: validated,
+      buyer: buyer || null,
+      total: Number(total.toFixed(2)),
+      status: 'pending',
+      createdAt: nowTs(),
+      updatedAt: nowTs()
     };
 
     await orderRef.set(order);
@@ -684,26 +788,39 @@ app.post('/store/orders/:orderId/checkout', async (req, res) => {
     const gymToken = await getValidGymAccessToken(gimnasioId);
 
     const preference = {
-      items: order.items.map(i => ({ title: i.nombre, unit_price: i.unit_price, quantity: i.quantity })),
+      items: order.items.map(i => ({
+        title: i.nombre,
+        unit_price: i.unit_price,
+        quantity: i.quantity
+      })),
       external_reference: `store|${gimnasioId}|${orderId}`,
       notification_url: `${process.env.PUBLIC_BASE_URL}/webhook-store?gymId=${encodeURIComponent(gimnasioId)}&orderId=${encodeURIComponent(orderId)}`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/store/success`,
-        failure: `${process.env.PUBLIC_BASE_URL}/store/failure`,
-        pending: `${process.env.PUBLIC_BASE_URL}/pending`
+        failure: `${process.env.PUBLIC_BASE_URL}/store/failure`
       },
       auto_return: 'approved'
     };
 
     const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${gymToken}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${gymToken}`,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(preference)
     });
-    if (!resp.ok) throw new Error(`Crear preferencia (gym) falló: ${resp.status} ${await resp.text()}`);
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`Crear preferencia (gym) falló: ${resp.status} ${t}`);
+    }
     const pref = await resp.json();
 
-    await orderRef.set({ mp_preference_id: pref.id, updatedAt: nowTs() }, { merge: true });
+    await orderRef.set({
+      mp_preference_id: pref.id,
+      updatedAt: nowTs()
+    }, { merge: true });
+
     res.json({ init_point: pref.init_point, sandbox_init_point: pref.sandbox_init_point, preference_id: pref.id });
   } catch (e) {
     console.error('checkout error:', e);
@@ -722,16 +839,27 @@ app.post('/store/orders/:orderId/mark-paid-manual', async (req, res) => {
       const snap = await tx.get(orderRef);
       if (!snap.exists) throw new Error('Orden no encontrada');
       const order = snap.data();
-      if (order.status === 'paid') return;
+      if (order.status === 'paid') return; // idempotente
 
-      for (const it of order.items || []) await discountStockTx(tx, gimnasioId, it);
+      for (const it of order.items || []) {
+        await discountStockTx(tx, gimnasioId, it);
+      }
 
       tx.set(orderRef, {
-        status: 'paid', paidAt: nowTs(), payment_method: metodo || 'manual', updatedAt: nowTs()
+        status: 'paid',
+        paidAt: nowTs(),
+        payment_method: metodo || 'manual',
+        updatedAt: nowTs()
       }, { merge: true });
 
       const txRef = db.collection(`gimnasios/${gimnasioId}/transacciones`).doc();
-      tx.set(txRef, { monto: order.total, fecha: nowTs(), metodo: metodo || 'manual', tipo: 'venta_tienda', orderId });
+      tx.set(txRef, {
+        monto: order.total,
+        fecha: nowTs(),
+        metodo: metodo || 'manual',
+        tipo: 'venta_tienda',
+        orderId
+      });
 
       const medio = medioKeyFrom(metodo || 'manual');
       acumularIngresoDiarioTx(tx, gimnasioId, 'tienda', Number(order.total || 0), medio);
@@ -749,19 +877,31 @@ app.post('/webhook-store', async (req, res) => {
     const gymId = req.query.gymId;
     const orderId = req.query.orderId;
     const paymentId = req.body?.data?.id;
-    if (!gymId || !orderId || !paymentId) return res.status(200).send('OK');
+    const topic = req.body?.type || req.body?.topic;
+
+    console.log('📩 Webhook Store:', { gymId, orderId, topic, paymentId });
+
+    if (!gymId || !orderId || !paymentId) {
+      return res.status(200).send('OK');
+    }
 
     const gymToken = await getValidGymAccessToken(gymId);
+
     const payResp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${gymToken}` }
     });
-    if (!payResp.ok) return res.status(200).send('OK');
+    if (!payResp.ok) {
+      console.error('payments get error:', await payResp.text());
+      return res.status(200).send('OK');
+    }
     const payment = await payResp.json();
     if (payment.status !== 'approved') return res.status(200).send('OK');
 
     const orderRef = db.doc(`gimnasios/${gymId}/tienda_ordenes/${orderId}`);
+
     const prev = await orderRef.get();
-    if (!prev.exists || prev.data().status === 'paid') return res.status(200).send('OK');
+    if (!prev.exists) return res.status(200).send('OK');
+    if (prev.data().status === 'paid') return res.status(200).send('OK');
 
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(orderRef);
@@ -769,21 +909,29 @@ app.post('/webhook-store', async (req, res) => {
       const order = snap.data();
       if (order.status === 'paid') return;
 
-      for (const it of order.items || []) await discountStockTx(tx, gymId, it);
+      for (const it of order.items || []) {
+        await discountStockTx(tx, gymId, it);
+      }
 
       tx.set(orderRef, {
-        status: 'paid', paidAt: nowTs(), payment_id: paymentId,
-        payment_method: payment.payment_type_id || null, updatedAt: nowTs()
+        status: 'paid',
+        paidAt: nowTs(),
+        payment_id: paymentId,
+        payment_method: payment.payment_type_id || null,
+        updatedAt: nowTs()
       }, { merge: true });
 
       const txRef = db.collection(`gimnasios/${gymId}/transacciones`).doc();
       tx.set(txRef, {
-        monto: order.total, fecha: nowTs(),
+        monto: order.total,
+        fecha: nowTs(),
         metodo: payment.payment_type_id || 'mp',
-        tipo: 'venta_tienda', orderId, paymentId
+        tipo: 'venta_tienda',
+        orderId,
+        paymentId
       });
 
-      const medio = medioKeyFrom(payment.payment_type_id || 'mp');
+      const medio = medioKeyFrom(payment.payment_type_id || 'mp'); // MP => online
       acumularIngresoDiarioTx(tx, gymId, 'tienda', Number(order.total || 0), medio);
     });
 
@@ -810,20 +958,27 @@ async function discountStockTx(tx, gimnasioId, it) {
   if (Array.isArray(p.StockPorVariante) && p.StockPorVariante.length > 0 && variant) {
     const col = normalize(variant.Color);
     const tal = normalize(variant.Talle);
+
     const list = [...p.StockPorVariante];
     let found = false;
+
     for (let i = 0; i < list.length; i++) {
       const v = list[i] || {};
       const vCol = normalize(v.Color);
       const vTal = normalize(v.Talle);
+
       const matchColor = col ? vCol === col : !v.Color;
       const matchTalle = tal ? vTal === tal : !v.Talle;
+
       if (matchColor && matchTalle) {
         const st = Number(v.Stock || 0);
         if (st < qty) throw new Error(`Stock insuficiente para variante ${v.Color || ''}/${v.Talle || ''}`);
-        list[i] = { ...v, Stock: st - qty }; found = true; break;
+        list[i] = { ...v, Stock: st - qty };
+        found = true;
+        break;
       }
     }
+
     if (!found) throw new Error('Variante no encontrada para descontar');
     tx.set(pRef, { StockPorVariante: list, UpdatedAt: nowTs() }, { merge: true });
     return;
@@ -849,16 +1004,20 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
 
     const hoy = new Date();
     let fechaInicio = hoy;
-    let tipoIngreso = 'altas';
+    let tipoIngreso = 'altas'; // si no tenía vencimiento → ALTA
     if (socioSnap.exists) {
       const d = socioSnap.data() || {};
       const v = d?.fechaVencimiento;
       const venc = v?.toDate?.() || (v ? new Date(v) : null);
-      if (venc) { tipoIngreso = 'renovaciones'; if (venc > hoy) fechaInicio = venc; }
+      if (venc) {
+        tipoIngreso = 'renovaciones';         // ya tenía plan → RENOVACIÓN
+        if (venc > hoy) fechaInicio = venc;   // se encadena
+      }
     }
     const fechaVenc = new Date(fechaInicio);
     fechaVenc.setDate(fechaVenc.getDate() + duracion);
 
+    // 1) Actualizar socio
     tx.set(socioRef, {
       estado: 'activo',
       planActual: planId,
@@ -868,13 +1027,18 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
       ultimaRenovacion: nowTs()
     }, { merge: true });
 
+    // 2) Registrar transacción
     tx.set(txRef, {
       tipo: 'membresia',
-      socioId, planId, monto, metodo,
+      socioId,
+      planId,
+      monto,
+      metodo,
       paymentId: paymentId || null,
       fecha: nowTs()
     });
 
+    // 3) Resumen mensual (AAAA-MM)
     const ym = new Date();
     const yyyy = ym.getFullYear();
     const mm = String(ym.getMonth() + 1).padStart(2, '0');
@@ -885,7 +1049,8 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
     const clienteDni    = d?.dni || d?.Dni || null;
 
     const pagoItem = {
-      clienteDni, clienteNombre,
+      clienteDni: clienteDni,
+      clienteNombre: clienteNombre,
       empleadoDni: metodo === 'manual' ? 'CAJA' : 'MP',
       fecha: new Date().toISOString(),
       metodo: metodo || 'mp',
@@ -896,6 +1061,7 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
 
     tx.set(resumenRef, { pagos: admin.firestore.FieldValue.arrayUnion(pagoItem) }, { merge: true });
 
+    // 4) Resumen día (ALTA/RENOVACIÓN, TZ BA)
     const medio = medioKeyFrom(metodo);
     acumularIngresoDiarioTx(tx, gimnasioId, tipoIngreso, Number(monto || 0), medio);
   });
