@@ -86,7 +86,7 @@ function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
   tx.set(ref, updates, { merge: true });
 }
 
-// ⬇️⬇️ PEGA EL HELPER ACÁ ⬇️⬇️
+// Normaliza módulos de un plan a arreglo de strings
 function extractPlanModules(plan = {}) {
   const out = new Set();
   const candidates = ['modulosPlan', 'modulos', 'modules', 'features'];
@@ -110,7 +110,6 @@ function extractPlanModules(plan = {}) {
   }
   return Array.from(out);
 }
-// ⬆️⬆️ FIN DEL HELPER ⬆️⬆️
 
 async function getGymIntegration(gymId) {
   const snap = await db.doc(`gimnasios/${gymId}/integraciones/mp`).get();
@@ -210,11 +209,11 @@ async function getReferralDiscountPctForBuyer(gymId) {
 }
 
 // ==============================
-//  LICENCIAS (tu flujo actual)
+//  LICENCIAS (tu flujo)
 // ==============================
 
 // Crear link de pago de licencia (usa TU cuenta MP)
-// AHORA: aplica descuento por referidos del COMPRADOR y REDIRIGE al checkout.
+// REDIRIGE al checkout y deja seteado notification_url → /webhook
 app.get('/crear-link-pago', async (req, res) => {
   const { gimnasioId, plan, ref, format } = req.query;
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
@@ -226,7 +225,7 @@ app.get('/crear-link-pago', async (req, res) => {
     const datos = planDoc.data() || {};
     const precio = Number(datos.precio || 0);
 
-    // 👇 descuento por referidos del comprador (tope 20%)
+    // descuento por referidos del comprador (tope 20%)
     const pct = await getReferralDiscountPctForBuyer(gimnasioId);
     const factor = Math.max(0, 1 - pct / 100);
     const precioConDto = Number((precio * factor).toFixed(2));
@@ -242,7 +241,6 @@ app.get('/crear-link-pago', async (req, res) => {
         unit_price: precioConDto,
         quantity: 1
       }],
-      // 👇 Mostrar descuento como línea en el checkout de MP
       ...(pct > 0 ? { coupon_code: `REFERIDOS_${pct}`, coupon_amount: discountAmount } : {}),
       statement_descriptor: 'NICHEAS GYM',
       metadata: {
@@ -253,6 +251,8 @@ app.get('/crear-link-pago', async (req, res) => {
         precio_original: precio
       },
       external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
+      // 👇 MUY IMPORTANTE
+      notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/success`,
         failure: `${process.env.PUBLIC_BASE_URL}/failure`
@@ -262,7 +262,6 @@ app.get('/crear-link-pago', async (req, res) => {
 
     const result = await mercadopago.preferences.create(preference);
 
-    // ➡️ Por defecto REDIRIGIMOS al init_point (mejor UX para el dueño del gym)
     if (format === 'json') {
       return res.json({
         init_point: result.body.init_point,
@@ -279,135 +278,175 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
-// Webhook de licencias (usa TU token global)
+// Webhook de LICENCIAS (usa TU token global)
 app.post('/webhook', async (req, res) => {
   try {
     console.log('📩 Webhook Licencias:', JSON.stringify(req.body, null, 2));
-    const paymentId = req.body?.data?.id;
-    if (!paymentId) return res.status(400).send('Sin ID de pago');
 
-    const payment = await mercadopago.payment.get(paymentId);
-    if (payment.body.status !== 'approved') return res.status(200).send('Pago no aprobado');
+    // ID de pago que envía MP
+    const paymentId = req.body?.data?.id || req.query?.id || req.body?.id;
+    if (!paymentId) return res.status(200).send('OK');
 
-    const extRef = payment.body.external_reference;
-    if (!extRef) return res.status(400).send('Falta external_reference');
+    // Leer pago con TU cuenta (licencias)
+    const paymentResp = await mercadopago.payment.get(paymentId);
+    const pay = paymentResp?.body;
+    if (!pay || pay.status !== 'approved') return res.status(200).send('OK');
 
-    // gym:xxx|plan:yyy|ref:zzz|disc:pct
-    const [gymPart, planPart, refPart, discPart] = extRef.split('|');
-    const gimnasioId = gymPart.split(':')[1];
-    const planId = planPart.split(':')[1];
-    const referidoDe = refPart?.split(':')[1] || null;
-    const discPctFromRef = Number((discPart || '').split(':')[1] || 0) || 0;
+    // Parsear external_reference
+    // Formato: gym:{gimnasioId}|plan:{planId}|ref:{referido?}|disc:{pct?}
+    let gimnasioId = null, planId = null, referidoDe = null;
+    const ext = pay.external_reference || '';
+    if (ext.includes('|')) {
+      for (const part of ext.split('|')) {
+        const [k, v] = part.split(':');
+        if (k === 'gym' || k === 'gimnasioId') gimnasioId = v;
+        if (k === 'plan') planId = v;
+        if (k === 'ref')  referidoDe = v || null;
+      }
+    }
+    // fallback metadata
+    gimnasioId = gimnasioId || pay.metadata?.gimnasioId || null;
+    planId     = planId     || pay.metadata?.plan       || null;
+    if (!gimnasioId || !planId) return res.status(200).send('OK');
 
-    const gymRef = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaRef = gymRef.collection('licencia').doc('datos');
-    const configRef = db.doc(`gimnasios/${gimnasioId}/config`); // ← documento (no subcolección)
+    const gymRef      = db.collection('gimnasios').doc(gimnasioId);
+    const licenciaRef = gymRef.collection('licencia').doc('datos');   // NUEVO
+    const statusRef   = gymRef.collection('license').doc('status');   // LEGACY
+    const configRef   = db.doc(`gimnasios/${gimnasioId}/config`);
+    const txRef       = gymRef.collection('transacciones').doc(String(paymentId));
+
+    // Idempotencia: si ya registramos este pago, salir
+    if ((await txRef.get()).exists) return res.status(200).send('OK');
 
     await db.runTransaction(async (transaction) => {
+      // Plan
       const planSnap = await db.collection('planesLicencia').doc(planId).get();
       if (!planSnap.exists) throw new Error('Plan no encontrado');
-
       const plan = planSnap.data() || {};
-      const duracion = Number(plan.duracion || 30);
+
+      const duracion      = Number(plan.duracion || plan.duracionDias || 30);
       const montoOriginal = Number(plan.precio || 0);
-      const tier = plan.tier || 'custom';
+      const maxUsuarios   = Number(plan.maxUsuarios || 0);
+      const tier          = plan.tier || 'custom';
+      const planNombre    = plan.nombre || planId;
 
-      // Soporte de módulos (cualquiera de las dos claves)
-      const modulosPlan = (plan.modulosPlan && typeof plan.modulosPlan === 'object')
-        ? plan.modulosPlan
-        : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
+      // módulos: objeto y arreglo normalizado (para compatibilidad)
+      const modsArray  = extractPlanModules(plan);
+      const modsObject = (plan.modulosPlan && typeof plan.modulosPlan === 'object')
+                           ? plan.modulosPlan
+                           : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
 
-      // Tope de usuarios (0 = ilimitado)
-      const maxUsuarios = Number(plan.maxUsuarios || 0);
+      // Estrategia: extender si es el mismo plan; cambiar si es distinto
+      const ahora = new Date();
+      let estrategia = 'nueva'; // extender | cambiar | nueva
+      let fechaInicio = ahora;
 
-      const fechaActual = new Date();
-      const licenciaSnap = await transaction.get(licenciaRef);
+      const licSnap = await transaction.get(licenciaRef);
+      if (licSnap.exists) {
+        const lic = licSnap.data() || {};
+        const actual = lic.plan;
+        const v = lic.fechaVencimiento;
+        const venc = v?.toDate?.() || (v ? new Date(v) : null);
 
-      let fechaInicio = fechaActual;
-      if (licenciaSnap.exists) {
-        const v = licenciaSnap.data().fechaVencimiento;
-        const vencimiento = v?.toDate?.() || new Date(v);
-        if (vencimiento && vencimiento > fechaActual) fechaInicio = vencimiento;
+        if (actual && actual === planId) {
+          estrategia = 'extender';
+          fechaInicio = (venc && venc > ahora) ? venc : ahora; // encadenado
+        } else {
+          estrategia = 'cambiar';
+          fechaInicio = ahora; // deja sin efecto el anterior
+        }
       }
+
       const fechaVencimiento = new Date(fechaInicio);
-      fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
+      fechaVencimiento.setDate(fechaVencimiento.getDate() + Math.max(1, duracion));
 
-      const montoPagado = Number(payment.body.transaction_amount || 0);
-      const descuentoAplicado = (montoOriginal > 0)
-        ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
-        : 0;
-
-      // 1) Estado de licencia (fuente de verdad para “✓ CONTRATADO”)
+      // 1) licencia/datos (fuente de verdad)
       const dataLic = {
         estado: 'activa',
         plan: planId,
-        planNombre: plan.nombre,
+        planNombre,
         fechaInicio,
         fechaVencimiento,
         ultimaActualizacion: FieldValue.serverTimestamp(),
         usoTrial: false
       };
       if (!Number.isNaN(maxUsuarios)) dataLic.licenciaMaxUsuarios = maxUsuarios;
-      if (modulosPlan) dataLic.modulosPlan = modulosPlan;
-
+      if (modsObject) dataLic.modulosPlan = modsObject;
+      if (modsArray?.length) dataLic.modulosHabilitados = modsArray;
       transaction.set(licenciaRef, dataLic, { merge: true });
 
-      // 2) Config del gym (cache para apps)
-      const dataCfg = {
+      // 2) license/status (LEGACY p/ clientes viejos)
+      const statusSnap = await transaction.get(statusRef);
+      const hwHash = statusSnap.exists ? (statusSnap.data()?.hardwareHash || null) : null;
+      transaction.set(statusRef, {
+        isActive: true,
+        isPaid: true,
+        trialStart: null,
+        trialEnd: fechaVencimiento,
+        hardwareHash: hwHash
+      }, { merge: true });
+
+      // 3) cache en config (para apps) + desbloquear
+      const cfg = {
         licenciaPlanId: planId,
-        licenciaNombre: plan.nombre,
+        licenciaNombre: planNombre,
         licenciaTier: tier,
         licenciaPrecio: montoOriginal,
         licenciaDuracionDias: duracion,
         licenciaMaxUsuarios: maxUsuarios,
+        licenciaBloqueada: false, // 🔓
         updatedAt: FieldValue.serverTimestamp()
       };
-      if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
+      if (modsObject) cfg.modulosPlan = modsObject;
+      if (modsArray?.length) cfg.modulosHabilitados = modsArray;
 
-      // si viene ref y el gym NO tenía referidoDe, lo dejamos fijo
+      // setear referido si no estaba
       if (referidoDe) {
         const cfgSnap = await transaction.get(configRef);
-        const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-        if (!cfgData.referidoDe) dataCfg.referidoDe = referidoDe;
+        if (!cfgSnap.exists || !cfgSnap.data()?.referidoDe) cfg.referidoDe = referidoDe;
       }
+      transaction.set(configRef, cfg, { merge: true });
 
-      transaction.set(configRef, dataCfg, { merge: true });
+      // 4) transacción + historial
+      const montoPagado = Number(pay.transaction_amount || 0);
+      const dtoAplicado = (montoOriginal > 0)
+        ? Math.max(0, Math.round((1 - (montoPagado / montoOriginal)) * 100))
+        : 0;
 
-      // 3) Registro contable
-      transaction.set(gymRef.collection('transacciones').doc(paymentId), {
+      transaction.set(txRef, {
         monto: montoPagado,
         fecha: nowTs(),
-        metodo: payment.body.payment_type_id,
-        referidoDe,
-        descuentoAplicado,
+        metodo: pay.payment_type_id || 'mp',
+        referidoDe: referidoDe || null,
+        descuentoAplicado: dtoAplicado,
         tipo: 'licencia',
-        detalle: `Licencia ${planId} - ${payment.body.description || ''}`
+        detalle: `Licencia ${planId} — ${estrategia}`,
+        paymentId: String(paymentId)
       });
 
-      // 4) Historial de licencias
-      transaction.set(gymRef.collection('licenciaHistorial').doc(), {
+      const histRef = gymRef.collection('licenciaHistorial').doc();
+      transaction.set(histRef, {
         fecha: nowTs(),
         plan: planId,
-        referidoDe,
-        descuentoAplicado,
-        montoPagado
+        referidoDe: referidoDe || null,
+        descuentoAplicado: dtoAplicado,
+        montoPagado,
+        estrategia
       });
 
-      // 5) Referidos — crédito ONE-TIME al referidor (solo primera compra de este gym)
+      // 5) Referidos — crédito one-time al referidor
       if (referidoDe) {
         const refRoot = db.collection('referidos').doc(referidoDe);
         const creditRef = refRoot.collection('creditos').doc(gimnasioId);
         const creditSnap = await transaction.get(creditRef);
-
         if (!creditSnap.exists) {
-          // suma +1 uso válido
           transaction.set(refRoot, { usosValidos: FieldValue.increment(1) }, { merge: true });
-          // (opcional) acumular % aplicado por sus referidos
-          transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
-
+          if (!Number.isNaN(dtoAplicado)) {
+            transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(dtoAplicado) }, { merge: true });
+          }
           transaction.set(creditRef, {
             gymReferidoId: gimnasioId,
-            firstPaymentId: paymentId,
+            firstPaymentId: String(paymentId),
             plan: planId,
             createdAt: nowTs()
           });
@@ -415,23 +454,18 @@ app.post('/webhook', async (req, res) => {
       }
     });
 
-    // 🔔 Notificación push (fire-and-forget, sin await)
+    // Notificación (best-effort)
     admin.messaging().sendToTopic(gimnasioId, {
-      notification: {
-        title: '🎉 ¡Licencia Renovada!',
-        body: `Plan ${planId} activado correctamente`
-      }
-    }).catch((err) => {
-      console.warn('FCM error:', err?.message);
-    });
+      notification: { title: '🎉 ¡Licencia activada!', body: `Plan ${planId} aplicado correctamente.` }
+    }).catch(() => {});
 
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ Error en webhook licencias:', error);
-    return res.status(500).send('Error procesando pago');
+    // devolvemos 200 para evitar reintentos agresivos de MP
+    return res.status(200).send('OK');
   }
 });
-
 
 // ==============================
 //  OAUTH MERCADO PAGO (gimnasios)
@@ -453,7 +487,7 @@ app.get('/mp/oauth/start', (req, res) => {
   res.redirect(`https://auth.mercadopago.com/authorization?${q.toString()}`);
 });
 
-// Alias para compatibilidad: /oauth/start → /mp/oauth/start
+// Alias para compatibilidad
 app.get('/oauth/start', (req, res) => {
   const url = new URL(`${req.protocol}://${req.get('host')}/mp/oauth/start`);
   if (req.query.gymId) url.searchParams.set('gymId', req.query.gymId);
@@ -502,9 +536,7 @@ async function handleOauthCallback(req, res) {
     res.status(500).send('Error en OAuth callback');
   }
 }
-
 app.get('/mp/oauth/callback', handleOauthCallback);
-// Alias para compatibilidad: /oauth/callback
 app.get('/oauth/callback', handleOauthCallback);
 
 // Refresh manual (opcional)
@@ -1042,7 +1074,7 @@ async function extendMembershipTx({ gimnasioId, socioId, planId, plan, monto, me
       fecha: nowTs()
     });
 
-    // 3) Resumen mensual (AAAA-MM) — tal cual lo tenías
+    // 3) Resumen mensual (AAAA-MM)
     const ym = new Date();
     const yyyy = ym.getFullYear();
     const mm = String(ym.getMonth() + 1).padStart(2, '0');
@@ -1079,5 +1111,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
-
-
