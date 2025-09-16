@@ -215,7 +215,7 @@ async function processLicensePaymentById(paymentId) {
     }
 
     const extRef = payment.external_reference || '';
-    // Formato esperado: gym:{gymId}|plan:{planId}|ref:{referidor?}|disc:{pct}
+    // gym:{gymId}|plan:{planId}|ref:{referidor?}|disc:{pct?}
     const [gymPart, planPart, refPart] = extRef.split('|');
     const gimnasioId = gymPart?.split(':')[1];
     const planId     = planPart?.split(':')[1];
@@ -228,32 +228,32 @@ async function processLicensePaymentById(paymentId) {
 
     const gymRef      = db.collection('gimnasios').doc(gimnasioId);
     const licenciaRef = gymRef.collection('licencia').doc('datos');
-    const configRef   = db.doc(`gimnasios/${gimnasioId}/config`);
+    // ✅ FIX: documento real dentro de la subcolección "config"
+    const configRef   = db.doc(`gimnasios/${gimnasioId}/config/datos`);
 
     await db.runTransaction(async (transaction) => {
       const planSnap = await db.collection('planesLicencia').doc(planId).get();
       if (!planSnap.exists) throw new Error('Plan no encontrado');
 
-      const plan = planSnap.data() || {};
+      const plan          = planSnap.data() || {};
       const duracion      = Number(plan.duracion || 30);
       const montoOriginal = Number(plan.precio || 0);
       const tier          = plan.tier || 'custom';
+      const maxUsuarios   = Number(plan.maxUsuarios || 0);
 
       // módulos (objeto o array admitidos)
-      const modulosPlan = (plan.modulosPlan && typeof plan.modulosPlan === 'object')
-        ? plan.modulosPlan
-        : ((plan.modulos && typeof plan.modulos === 'object') ? plan.modulos : null);
+      let modulosPlan = null;
+      if (plan.modulosPlan && typeof plan.modulosPlan === 'object') modulosPlan = plan.modulosPlan;
+      else if (plan.modulos && typeof plan.modulos === 'object')   modulosPlan = plan.modulos;
 
-      const maxUsuarios = Number(plan.maxUsuarios || 0);
-
-      const fechaActual  = new Date();
-      const licSnap      = await transaction.get(licenciaRef);
-      let   fechaInicio  = fechaActual;
+      const hoy = new Date();
+      const licSnap = await transaction.get(licenciaRef);
+      let   fechaInicio = hoy;
 
       if (licSnap.exists) {
         const v = licSnap.data().fechaVencimiento;
-        const venc = v?.toDate?.() || new Date(v);
-        if (venc && venc > fechaActual) fechaInicio = venc; // encadena días
+        const venc = v?.toDate?.() || (v ? new Date(v) : null);
+        if (venc && venc > hoy) fechaInicio = venc; // encadena días si había vigente
       }
 
       const fechaVencimiento = new Date(fechaInicio);
@@ -268,7 +268,7 @@ async function processLicensePaymentById(paymentId) {
       const dataLic = {
         estado: 'activa',
         plan: planId,
-        planNombre: plan.nombre,
+        planNombre: plan.nombre || planId,
         fechaInicio,
         fechaVencimiento,
         ultimaActualizacion: FieldValue.serverTimestamp(),
@@ -282,7 +282,7 @@ async function processLicensePaymentById(paymentId) {
       // 2) config (cache para clientes)
       const dataCfg = {
         licenciaPlanId: planId,
-        licenciaNombre: plan.nombre,
+        licenciaNombre: plan.nombre || planId,
         licenciaTier: tier,
         licenciaPrecio: montoOriginal,
         licenciaDuracionDias: duracion,
@@ -291,6 +291,7 @@ async function processLicensePaymentById(paymentId) {
       };
       if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
 
+      // si viene ref y el gym NO tenía referidoDe, lo guardamos
       if (referidoDe) {
         const cfgSnap = await transaction.get(configRef);
         const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
@@ -318,11 +319,11 @@ async function processLicensePaymentById(paymentId) {
         montoPagado
       });
 
-      // 5) referidos (crédito one-time)
+      // 5) referidos (crédito one-time al referidor)
       if (referidoDe) {
-        const refRoot   = db.collection('referidos').doc(referidoDe);
-        const creditRef = refRoot.collection('creditos').doc(gimnasioId);
-        const creditSnap= await transaction.get(creditRef);
+        const refRoot    = db.collection('referidos').doc(referidoDe);
+        const creditRef  = refRoot.collection('creditos').doc(gimnasioId);
+        const creditSnap = await transaction.get(creditRef);
         if (!creditSnap.exists) {
           transaction.set(refRoot, { usosValidos: FieldValue.increment(1) }, { merge: true });
           transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
@@ -425,8 +426,31 @@ app.get('/crear-link-pago', async (req, res) => {
 // ==============================
 app.post('/webhook', async (req, res) => {
   try {
-    console.log('📩 Webhook Licencias:', JSON.stringify(req.body));
-    const paymentId = req.body?.data?.id || req.body?.id;
+    console.log('📩 Webhook Licencias:', JSON.stringify(req.body, null, 2));
+
+    let paymentId = req.body?.data?.id || req.body?.id || null;
+    const topic   = req.body?.topic || req.body?.type || null;
+
+    // MP a veces manda: { topic: 'merchant_order', resource: '.../merchant_orders/{id}' }
+    if (!paymentId && (topic === 'merchant_order' || req.body?.resource)) {
+      // 1) sacar merchant_order_id
+      let moId = null;
+      const resUrl = req.body?.resource || '';
+      const m = /merchant_orders\/(\d+)/.exec(resUrl);
+      if (m) moId = m[1];
+
+      // 2) pedir la orden y tomar el primer pago approved
+      if (moId) {
+        try {
+          const ord = await mercadopago.merchant_orders.get(moId);
+          const pay = (ord?.body?.payments || []).find(p => p?.id) || null;
+          if (pay?.id) paymentId = String(pay.id);
+        } catch (e) {
+          console.warn('merchant_order lookup error:', e?.message);
+        }
+      }
+    }
+
     if (!paymentId) return res.status(200).send('OK'); // idempotente
 
     const r = await processLicensePaymentById(String(paymentId));
@@ -434,7 +458,7 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ Error en webhook licencias:', error);
-    return res.status(200).send('OK'); // evitar reintentos agresivos
+    return res.status(200).send('OK'); // evitá reintentos agresivos de MP
   }
 });
 
@@ -1075,3 +1099,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
