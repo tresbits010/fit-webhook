@@ -227,17 +227,30 @@ async function processLicensePaymentById(paymentId) {
       return { ok: false, reason: 'bad_extref' };
     }
 
+    // Intento best-effort de leer preference_id via merchant_order
+    let preferenceId = null;
+    try {
+      const moId = payment?.order?.id || null;
+      if (moId) {
+        const ord = await mercadopago.merchant_orders.get(moId);
+        preferenceId = ord?.body?.preference_id || null;
+      }
+    } catch { /* noop */ }
+
     const gymRef       = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaRef  = gymRef.collection('licencia').doc('datos');
-    const configRef    = db.doc(`gimnasios/${gimnasioId}/config/datos`);
+    const licenciaCfg  = gymRef.collection('licencia').doc('config');
     const txIdRef      = db.collection('_mp_processed').doc(String(payment.id)); // marca idempotente
+    const historialRef = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
+    const prefRef      = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
 
     await db.runTransaction(async (transaction) => {
       // ⛑️ idempotencia: si ya procesamos este payment, salimos
       const already = await transaction.get(txIdRef);
       if (already.exists) return;
 
-      const planSnap = await db.collection('planesLicencia').doc(planId).get();
+      // === leer plan desde CATÁLOGO raíz 'licencias' (fallback a planesLicencia por compat) ===
+      let planSnap = await db.collection('licencias').doc(planId).get();
+      if (!planSnap.exists) planSnap = await db.collection('planesLicencia').doc(planId).get(); // compat temporal
       if (!planSnap.exists) throw new Error('Plan no encontrado');
 
       const plan          = planSnap.data() || {};
@@ -251,6 +264,14 @@ async function processLicensePaymentById(paymentId) {
       if (plan.modulosPlan && typeof plan.modulosPlan === 'object') modulosPlan = plan.modulosPlan;
       else if (plan.modulos && typeof plan.modulos === 'object')   modulosPlan = plan.modulos;
 
+      // límites (si los definís en el plan)
+      const limits = {
+        maxMembers:     Number(plan.maxMembers ?? maxUsuarios ?? 0),
+        maxDevices:     Number(plan.maxDevices ?? 0),
+        maxBranches:    Number(plan.maxBranches ?? 1),
+        maxOfflineHours:Number(plan.maxOfflineHours ?? 168)
+      };
+
       // ✅ SIN ENCADENAR: siempre desde ahora
       const fechaInicio = new Date();
       const fechaVencimiento = new Date(fechaInicio);
@@ -261,42 +282,33 @@ async function processLicensePaymentById(paymentId) {
         ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
         : 0;
 
-      // 1) licencia/datos (fuente de verdad)
-      const dataLic = {
-        estado: 'activa',
+      // 1) licencia/config (fuente de verdad por gym)
+      const dataCfg = {
+        status: 'active',
         plan: planId,
         planNombre: plan.nombre || planId,
-        fechaInicio,
-        fechaVencimiento,
-        ultimaActualizacion: FieldValue.serverTimestamp(),
-        usoTrial: false
+        expiry: fechaVencimiento,             // Timestamp
+        updatedAt: FieldValue.serverTimestamp(),
+        tier,
+        limits
       };
-      if (!Number.isNaN(maxUsuarios)) dataLic.licenciaMaxUsuarios = maxUsuarios;
-      if (modulosPlan) dataLic.modulosPlan = modulosPlan;
-
-      transaction.set(licenciaRef, dataLic, { merge: true });
-
-      // 2) config (cache para clientes)
-      const dataCfg = {
-        licenciaPlanId: planId,
-        licenciaNombre: plan.nombre || planId,
-        licenciaTier: tier,
-        licenciaPrecio: montoOriginal,
-        licenciaDuracionDias: duracion,
-        licenciaMaxUsuarios: maxUsuarios,
-        updatedAt: FieldValue.serverTimestamp()
-      };
-      if (modulosPlan) dataCfg.modulosPlan = modulosPlan;
-
-      // si viene ref y el gym NO tenía referidoDe, lo guardamos
-      if (referidoDe) {
-        const cfgSnap = await transaction.get(configRef);
-        const cfgData = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-        if (!cfgData.referidoDe) dataCfg.referidoDe = referidoDe;
+      if (!Number.isNaN(maxUsuarios)) dataCfg.licenciaMaxUsuarios = maxUsuarios;
+      if (modulosPlan) {
+        // normalizamos a 'modules' (pero si preferís 'modulosPlan', cámbialo)
+        dataCfg.modules = modulosPlan;
       }
-      transaction.set(configRef, dataCfg, { merge: true });
+      transaction.set(licenciaCfg, dataCfg, { merge: true });
 
-      // 3) contable (idempotente por payment.id)
+      // 2) historial
+      transaction.set(historialRef, {
+        fecha: nowTs(),
+        plan: planId,
+        referidoDe,
+        descuentoAplicado,
+        montoPagado
+      }, { merge: true });
+
+      // 3) transacciones (idempotente por payment.id)
       transaction.set(gymRef.collection('transacciones').doc(String(payment.id)), {
         monto: montoPagado,
         fecha: nowTs(),
@@ -307,14 +319,13 @@ async function processLicensePaymentById(paymentId) {
         detalle: `Licencia ${planId} - ${payment.description || ''}`
       }, { merge: true });
 
-      // 4) historial (idempotente por payment.id) ⟵ FIX duplicados
-      transaction.set(gymRef.collection('licenciaHistorial').doc(String(payment.id)), {
-        fecha: nowTs(),
-        plan: planId,
-        referidoDe,
-        descuentoAplicado,
-        montoPagado
-      }, { merge: true });
+      // 4) preferencia → approved (si la encontramos)
+      if (prefRef) {
+        transaction.set(prefRef, {
+          status: 'approved',
+          updatedAt: nowTs()
+        }, { merge: true });
+      }
 
       // 5) referidos (crédito one-time al referidor)
       if (referidoDe) {
@@ -362,7 +373,9 @@ app.get('/crear-link-pago', async (req, res) => {
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
 
   try {
-    const planDoc = await db.collection('planesLicencia').doc(plan).get();
+    // === leer plan desde 'licencias' (fallback a planesLicencia por compat) ===
+    let planDoc = await db.collection('licencias').doc(plan).get();
+    if (!planDoc.exists) planDoc = await db.collection('planesLicencia').doc(plan).get(); // compat temporal
     if (!planDoc.exists) return res.status(404).send('Plan no encontrado');
 
     const datos  = planDoc.data() || {};
@@ -404,6 +417,18 @@ app.get('/crear-link-pago', async (req, res) => {
     };
 
     const result = await mercadopago.preferences.create(preference);
+
+    // Guardamos la preferencia pendiente bajo el gym (para dashboard/UX)
+    try {
+      const prefRef = db.doc(`gimnasios/${gimnasioId}/licencia/prefs/items/${result.body.id}`);
+      await prefRef.set({
+        plan,
+        status: 'pending',
+        init_point: result.body.init_point,
+        createdAt: nowTs(),
+        updatedAt: nowTs()
+      }, { merge: true });
+    } catch { /* noop */ }
 
     if (format === 'json') {
       return res.json({
@@ -502,7 +527,7 @@ app.get('/oauth/start', (req, res) => {
 async function handleOauthCallback(req, res) {
   try {
     const code = req.query.code;
-       const gymId = req.query.state;
+    const gymId = req.query.state;
     if (!code || !gymId) return res.status(400).send('Faltan code/state');
 
     const tokenJson = await mpOAuthTokenExchange({ code, redirectUri: process.env.MP_REDIRECT_URI });
