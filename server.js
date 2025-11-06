@@ -1,7 +1,7 @@
 // server.js
 // ======================================================
 // Webhook / Backend FitSuite Pro - LICENCIAS + MP OAuth
-// - Licencias (catálogo raíz "licencias" con fallback a "planesLicencia")
+// - Fuente de verdad centralizada en gimnasios/{gymId}/licencia/datos (version: 2 + rev++)
 // - Cache para cliente de escritorio en gimnasios/{gymId}/config/config
 // - Módulos y límites normalizados (limits: maxDevices, maxBranches, maxOfflineHours, maxMembers)
 // - Dispositivos (claim/heartbeat/revoke) para multi-PC por plan
@@ -279,11 +279,12 @@ async function processLicensePaymentById(paymentId) {
       }
     } catch { /* noop */ }
 
-    const gymRef       = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaCfg  = gymRef.collection('licencia').doc('config');
-    const txIdRef      = db.collection('_mp_processed').doc(String(payment.id)); // marca idempotente
-    const historialRef = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
-    const prefRef      = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
+    const gymRef        = db.collection('gimnasios').doc(gimnasioId);
+    const licenciaDatos = gymRef.collection('licencia').doc('datos');   // ⬅️ fuente de verdad
+    const licenciaCfg   = gymRef.collection('licencia').doc('config');  // cache / compat
+    const txIdRef       = db.collection('_mp_processed').doc(String(payment.id)); // marca idempotente
+    const historialRef  = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
+    const prefRef       = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
 
     await db.runTransaction(async (transaction) => {
       // ⛑️ idempotencia: si ya procesamos este payment, salimos
@@ -311,7 +312,28 @@ async function processLicensePaymentById(paymentId) {
         ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
         : 0;
 
-      // 1) licencia/config — FUENTE DE VERDAD
+      // 1) licencia/datos — FUENTE DE VERDAD (schema v2 + rev++)
+      transaction.set(
+        licenciaDatos,
+        {
+          version: 2,                         // versión de ESQUEMA (fija)
+          rev: FieldValue.increment(1),       // ⬆️ sube en cada cambio real de licencia
+          status: 'active',
+          plan: planId,
+          planNombre: planObj.nombre || planId,
+          fechaInicio: fechaInicio,           // mantenemos nombres legacy para el cliente
+          fechaVencimiento: fechaVencimiento, // idem
+          usoTrial: false,
+          licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
+          modulosPlan: modulesMap,            // legacy
+          modules: modulesMap,                // normalizado
+          limits,                             // normalizado
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+
+      // 1.bis) licencia/config — CACHE/compat (clientes viejos o dashboards)
       const dataCfg = {
         status: 'active',
         plan: planId,
@@ -320,25 +342,13 @@ async function processLicensePaymentById(paymentId) {
         expiry: fechaVencimiento,
         updatedAt: FieldValue.serverTimestamp(),
         tier,
-        limits,                        // límites normalizados
+        limits,
         licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
-        modules: modulesMap            // mapa booleano
+        modules: modulesMap
       };
       transaction.set(licenciaCfg, dataCfg, { merge: true });
 
-      // (Compat) licencia/datos para clientes viejos
-      transaction.set(gymRef.collection('licencia').doc('datos'), {
-        status: 'active',
-        plan: planId,
-        planNombre: planObj.nombre || planId,
-        fechaInicio: fechaInicio,
-        fechaVencimiento: fechaVencimiento,
-        usoTrial: false,
-        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
-        modulosPlan: modulesMap
-      }, { merge: true });
-
-      // 1.bis) CACHE para el cliente de escritorio: gimnasios/{gymId}/config/config
+      // 1.ter) CACHE para el cliente de escritorio: gimnasios/{gymId}/config/config
       const modulosActivados = {};
       for (const [k, v] of Object.entries(modulesMap)) if (v) modulosActivados[k] = true;
 
