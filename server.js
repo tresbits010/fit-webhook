@@ -1,6 +1,16 @@
 // server.js
+// ======================================================
+// Webhook / Backend FitSuite Pro - LICENCIAS + MP OAuth
+// - Licencias (catálogo raíz "licencias" con fallback a "planesLicencia")
+// - Cache para cliente de escritorio en gimnasios/{gymId}/config/config
+// - Módulos y límites normalizados (limits: maxDevices, maxBranches, maxOfflineHours, maxMembers)
+// - Dispositivos (claim/heartbeat/revoke) para multi-PC por plan
+// - Membresías y Tienda (checkout + webhooks) [opcional, puedes comentar si no usas]
+// Requiere: Node 18+, express, firebase-admin, mercadopago, dotenv
+// ======================================================
+
 const express = require('express');
-const mercadopago = require('mercadopago'); // para LICENCIAS (tu cuenta)
+const mercadopago = require('mercadopago'); // SOLO para licencias (tu cuenta)
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
 dotenv.config();
@@ -11,6 +21,9 @@ app.use(express.json());
 // ==============================
 //  Firebase Admin
 // ==============================
+if (!process.env.FIREBASE_CREDENTIALS) {
+  throw new Error('Falta FIREBASE_CREDENTIALS (JSON) en variables de entorno');
+}
 const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
@@ -19,6 +32,9 @@ const FieldValue = admin.firestore.FieldValue;
 // ==============================
 //  MP SDK (para LICENCIAS)
 // ==============================
+if (!process.env.MP_ACCESS_TOKEN) {
+  console.warn('⚠️ Falta MP_ACCESS_TOKEN (usado para leer pagos de LICENCIAS con tu cuenta)');
+}
 mercadopago.configure({ access_token: process.env.MP_ACCESS_TOKEN });
 
 // ==============================
@@ -86,9 +102,21 @@ function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
   tx.set(ref, updates, { merge: true });
 }
 
-// (por si lo usás en otro lado)
-function extractPlanModules(plan = {}) {
-  const out = new Set();
+// ==============================
+//  Helpers de Plan (normalización)
+// ==============================
+async function readPlanById(planId) {
+  // lee desde 'licencias' y si no existe, fallback a 'planesLicencia'
+  let planSnap = await db.collection('licencias').doc(planId).get();
+  if (!planSnap.exists) planSnap = await db.collection('planesLicencia').doc(planId).get();
+  if (!planSnap.exists) throw new Error('Plan no encontrado');
+  const plan = planSnap.data() || {};
+  return { id: planId, ...plan };
+}
+
+function normalizePlanModules(plan) {
+  // admite: modulosPlan (objeto o array), modulos, modules, features
+  const out = {};
   const candidates = ['modulosPlan', 'modulos', 'modules', 'features'];
   for (const key of candidates) {
     const v = plan[key];
@@ -96,25 +124,40 @@ function extractPlanModules(plan = {}) {
     if (Array.isArray(v)) {
       for (const item of v) {
         const s = (item || '').toString().trim();
-        if (s) out.add(s);
+        if (s) out[s] = true;
       }
     } else if (typeof v === 'object') {
       for (const [k, val] of Object.entries(v)) {
         if (!k) continue;
-        const enabled = (typeof val === 'boolean') ? val : !!val;
-        if (enabled) out.add(k);
+        out[k] = (typeof val === 'boolean') ? val : !!val;
       }
     }
   }
-  return Array.from(out);
+  return out; // mapa { feature: true/false }
 }
 
-async function getGymIntegration(gymId) {
-  const snap = await db.doc(`gimnasios/${gymId}/integraciones/mp`).get();
-  return snap.exists ? snap.data() : null;
+function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
+  // Soporta:
+  // - raíz: maxDevices, maxBranches, maxOfflineHours, maxMembers/maxUsuarios
+  // - anidado: limits.maxDevices, limits.maxBranches, limits.maxOfflineHours, limits.maxMembers
+  const lim = Object.assign({}, plan.limits || {});
+  const norm = {
+    maxMembers:      Number(lim.maxMembers      ?? plan.maxMembers ?? plan.maxUsuarios ?? fallbackMaxUsuarios ?? 0),
+    maxDevices:      Number(lim.maxDevices      ?? plan.maxDevices ?? 1),
+    maxBranches:     Number(lim.maxBranches     ?? plan.maxBranches ?? 1),
+    maxOfflineHours: Number(lim.maxOfflineHours ?? plan.maxOfflineHours ?? 168)
+  };
+  // saneo mínimos razonables
+  if (Number.isNaN(norm.maxDevices) || norm.maxDevices < 1) norm.maxDevices = 1;
+  if (Number.isNaN(norm.maxBranches) || norm.maxBranches < 1) norm.maxBranches = 1;
+  if (Number.isNaN(norm.maxOfflineHours) || norm.maxOfflineHours < 24) norm.maxOfflineHours = 24;
+  if (Number.isNaN(norm.maxMembers) || norm.maxMembers < 0) norm.maxMembers = 0;
+  return norm;
 }
 
-// --- OAuth helpers (fetch nativo Node 18+) ---
+// ==============================
+//  OAuth / Tokens (gimnasios)
+// ==============================
 async function mpOAuthTokenExchange({ code, redirectUri }) {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -190,7 +233,7 @@ async function getValidGymAccessToken(gymId) {
 }
 
 // ==============================
-//  REFERIDOS — helpers
+//  REFERIDOS — helpers (opcional)
 // ==============================
 async function getReferralDiscountPctForBuyer(gymId) {
   try {
@@ -205,8 +248,7 @@ async function getReferralDiscountPctForBuyer(gymId) {
 }
 
 // =======================================================
-//  LICENCIAS — procesar pago por paymentId
-//  (SIN encadenar + idempotente + sin duplicados)
+//  LICENCIAS — procesar pago por paymentId (idempotente)
 // =======================================================
 async function processLicensePaymentById(paymentId) {
   try {
@@ -248,31 +290,18 @@ async function processLicensePaymentById(paymentId) {
       const already = await transaction.get(txIdRef);
       if (already.exists) return;
 
-      // === leer plan desde CATÁLOGO raíz 'licencias' (fallback a planesLicencia por compat) ===
-      let planSnap = await db.collection('licencias').doc(planId).get();
-      if (!planSnap.exists) planSnap = await db.collection('planesLicencia').doc(planId).get(); // compat temporal
-      if (!planSnap.exists) throw new Error('Plan no encontrado');
+      // === leer y normalizar plan ===
+      const planObj = await readPlanById(planId);
 
-      const plan          = planSnap.data() || {};
-      const duracion      = Number(plan.duracion || 30);
-      const montoOriginal = Number(plan.precio || 0);
-      const tier          = plan.tier || 'custom';
-      const maxUsuarios   = Number(plan.maxUsuarios || 0);
+      const duracion      = Number(planObj.duracion ?? planObj.duracionDias ?? 30);
+      const montoOriginal = Number(planObj.precio ?? 0);
+      const tier          = planObj.tier || 'custom';
+      const maxUsuarios   = Number(planObj.maxUsuarios ?? 0);
 
-      // módulos (objeto o array admitidos)
-      let modulosPlan = null;
-      if (plan.modulosPlan && typeof plan.modulosPlan === 'object') modulosPlan = plan.modulosPlan;
-      else if (plan.modulos && typeof plan.modulos === 'object')   modulosPlan = plan.modulos;
+      const modulesMap = normalizePlanModules(planObj);
+      const limits     = normalizePlanLimits(planObj, maxUsuarios);
 
-      // límites (si los definís en el plan)
-      const limits = {
-        maxMembers:     Number(plan.maxMembers ?? maxUsuarios ?? 0),
-        maxDevices:     Number(plan.maxDevices ?? 0),
-        maxBranches:    Number(plan.maxBranches ?? 1),
-        maxOfflineHours:Number(plan.maxOfflineHours ?? 168)
-      };
-
-      // ✅ SIN ENCADENAR: siempre desde ahora
+      // SIN encadenar: siempre desde ahora
       const fechaInicio = new Date();
       const fechaVencimiento = new Date(fechaInicio);
       fechaVencimiento.setDate(fechaVencimiento.getDate() + duracion);
@@ -282,22 +311,49 @@ async function processLicensePaymentById(paymentId) {
         ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
         : 0;
 
-      // 1) licencia/config (fuente de verdad por gym)
+      // 1) licencia/config — FUENTE DE VERDAD
       const dataCfg = {
         status: 'active',
         plan: planId,
-        planNombre: plan.nombre || planId,
-        expiry: fechaVencimiento,             // Timestamp
+        planNombre: planObj.nombre || planId,
+        start: fechaInicio,
+        expiry: fechaVencimiento,
         updatedAt: FieldValue.serverTimestamp(),
         tier,
-        limits
+        limits,                        // límites normalizados
+        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
+        modules: modulesMap            // mapa booleano
       };
-      if (!Number.isNaN(maxUsuarios)) dataCfg.licenciaMaxUsuarios = maxUsuarios;
-      if (modulosPlan) {
-        // normalizamos a 'modules' (pero si preferís 'modulosPlan', cámbialo)
-        dataCfg.modules = modulosPlan;
-      }
       transaction.set(licenciaCfg, dataCfg, { merge: true });
+
+      // (Compat) licencia/datos para clientes viejos
+      transaction.set(gymRef.collection('licencia').doc('datos'), {
+        status: 'active',
+        plan: planId,
+        planNombre: planObj.nombre || planId,
+        fechaInicio: fechaInicio,
+        fechaVencimiento: fechaVencimiento,
+        usoTrial: false,
+        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
+        modulosPlan: modulesMap
+      }, { merge: true });
+
+      // 1.bis) CACHE para el cliente de escritorio: gimnasios/{gymId}/config/config
+      const modulosActivados = {};
+      for (const [k, v] of Object.entries(modulesMap)) if (v) modulosActivados[k] = true;
+
+      transaction.set(gymRef.collection('config').doc('config'), {
+        licenciaPlanId: planId,
+        licenciaNombre: planObj.nombre || planId,
+        licenciaDuracionDias: duracion,
+        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
+        licenciaTier: tier,
+        licenciaPrecio: montoOriginal,
+        modulosPlan: modulesMap,
+        modulosActivados, // mapa booleano
+        limits,           // también en la caché
+        ultimaActualizacionLicencia: FieldValue.serverTimestamp()
+      }, { merge: true });
 
       // 2) historial
       transaction.set(historialRef, {
@@ -327,7 +383,7 @@ async function processLicensePaymentById(paymentId) {
         }, { merge: true });
       }
 
-      // 5) referidos (crédito one-time al referidor)
+      // 5) referidos (crédito one-time al referidor) — opcional
       if (referidoDe) {
         const refRoot    = db.collection('referidos').doc(referidoDe);
         const creditRef  = refRoot.collection('creditos').doc(gimnasioId);
@@ -373,13 +429,9 @@ app.get('/crear-link-pago', async (req, res) => {
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
 
   try {
-    // === leer plan desde 'licencias' (fallback a planesLicencia por compat) ===
-    let planDoc = await db.collection('licencias').doc(plan).get();
-    if (!planDoc.exists) planDoc = await db.collection('planesLicencia').doc(plan).get(); // compat temporal
-    if (!planDoc.exists) return res.status(404).send('Plan no encontrado');
-
-    const datos  = planDoc.data() || {};
-    const precio = Number(datos.precio || 0);
+    // lee plan (catálogo raíz)
+    const planObj = await readPlanById(String(plan));
+    const precio = Number(planObj.precio || 0);
 
     // descuento por referidos del COMPRADOR (tope 20%)
     const pct          = await getReferralDiscountPctForBuyer(gimnasioId);
@@ -387,8 +439,8 @@ app.get('/crear-link-pago', async (req, res) => {
     const precioConDto = Number((precio * factor).toFixed(2));
     const discountAmt  = Math.max(0, Number((precio - precioConDto).toFixed(2)));
 
-    const titleBase  = `Licencia ${datos.nombre || plan}`;
-    const titleConDto= pct > 0 ? `${titleBase} (−${pct}% referidos)` : titleBase;
+    const titleBase   = `Licencia ${planObj.nombre || plan}`;
+    const titleConDto = pct > 0 ? `${titleBase} (−${pct}% referidos)` : titleBase;
 
     const preference = {
       items: [{
@@ -406,7 +458,6 @@ app.get('/crear-link-pago', async (req, res) => {
         precio_original: precio
       },
       external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
-      // 🔔 IMPORTANTE: para que MP llame a nuestro webhook
       notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`,
       back_urls: {
         success: `${process.env.PUBLIC_BASE_URL}/success`,
@@ -447,7 +498,7 @@ app.get('/crear-link-pago', async (req, res) => {
 });
 
 // ==============================
-//  LICENCIAS — Webhook + páginas de retorno (fallback)
+//  LICENCIAS — Webhook + páginas de retorno
 // ==============================
 app.post('/webhook', async (req, res) => {
   try {
@@ -567,6 +618,7 @@ async function handleOauthCallback(req, res) {
 }
 app.get('/mp/oauth/callback', handleOauthCallback);
 app.get('/oauth/callback', handleOauthCallback);
+
 app.post('/mp/oauth/refresh/:gymId', async (req, res) => {
   try {
     const gymId = req.params.gymId;
@@ -600,7 +652,97 @@ app.post('/mp/oauth/refresh/:gymId', async (req, res) => {
 });
 
 // ==============================
-//  MEMBRESÍAS (altas / renovaciones)
+//  DISPOSITIVOS (multi-PC)
+// ==============================
+async function getGymLimits(gymId) {
+  const cache = await db.doc(`gimnasios/${gymId}/config/config`).get();
+  const limits = cache.exists ? (cache.data()?.limits || null) : null;
+  if (limits) return limits;
+
+  const lic = await db.doc(`gimnasios/${gymId}/licencia/config`).get();
+  const l2 = lic.exists ? (lic.data()?.limits || null) : null;
+  return l2 || { maxDevices: 1, maxBranches: 1, maxOfflineHours: 168, maxMembers: 0 };
+}
+async function countActiveDevices(gymId) {
+  const qs = await db.collection(`gimnasios/${gymId}/devices`).where('revoked', '!=', true).get();
+  return qs.size;
+}
+
+// CLAIM
+app.post('/devices/claim', async (req, res) => {
+  try {
+    const { gimnasioId, hwid, name } = req.body || {};
+    if (!gimnasioId || !hwid) return res.status(400).json({ error: 'Faltan gimnasioId/hwid' });
+
+    const limits = await getGymLimits(gimnasioId);
+    const max = Number(limits.maxDevices ?? 1);
+
+    const devRef = db.doc(`gimnasios/${gimnasioId}/devices/${hwid}`);
+    const snap = await devRef.get();
+
+    if (!snap.exists) {
+      const current = await countActiveDevices(gimnasioId);
+      if (current >= max) return res.status(403).json({ error: 'Cupo de dispositivos alcanzado' });
+
+      await devRef.set({
+        hwid,
+        name: name || null,
+        claimedAt: nowTs(),
+        lastSeenAt: nowTs(),
+        revoked: false
+      }, { merge: true });
+
+      return res.json({ ok: true, claimed: true, remaining: Math.max(0, max - (current + 1)), maxDevices: max });
+    }
+
+    const data = snap.data() || {};
+    if (data.revoked) return res.status(403).json({ error: 'Dispositivo revocado' });
+
+    await devRef.set({ lastSeenAt: nowTs(), name: name || data.name || null }, { merge: true });
+    const current = await countActiveDevices(gimnasioId);
+    return res.json({ ok: true, claimed: false, remaining: Math.max(0, max - current), maxDevices: max });
+  } catch (e) {
+    console.error('devices/claim error:', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// HEARTBEAT
+app.post('/devices/heartbeat', async (req, res) => {
+  try {
+    const { gimnasioId, hwid } = req.body || {};
+    if (!gimnasioId || !hwid) return res.status(400).json({ error: 'Faltan gimnasioId/hwid' });
+
+    const devRef = db.doc(`gimnasios/${gimnasioId}/devices/${hwid}`);
+    const snap = await devRef.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Device no registrado' });
+    if (snap.data()?.revoked) return res.status(403).json({ error: 'Revocado' });
+
+    await devRef.set({ lastSeenAt: nowTs() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('devices/heartbeat error:', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// REVOKE
+app.post('/devices/revoke', async (req, res) => {
+  try {
+    const { gimnasioId, hwid } = req.body || {};
+    if (!gimnasioId || !hwid) return res.status(400).json({ error: 'Faltan gimnasioId/hwid' });
+
+    const devRef = db.doc(`gimnasios/${gimnasioId}/devices/${hwid}`);
+    await devRef.set({ revoked: true, revokedAt: nowTs() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('devices/revoke error:', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// ==============================
+//  MEMBRESÍAS (altas/renovaciones) — OPCIONAL
 // ==============================
 app.post('/memberships/register', async (req, res) => {
   try {
@@ -763,7 +905,7 @@ app.post('/webhook-memberships', async (req, res) => {
 });
 
 // ==============================
-//  TIENDA (carrito / checkout / webhook)
+//  TIENDA (carrito / checkout / webhook) — OPCIONAL
 // ==============================
 app.post('/store/orders', async (req, res) => {
   try {
