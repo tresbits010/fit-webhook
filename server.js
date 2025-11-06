@@ -1,11 +1,14 @@
 // server.js
 // ======================================================
 // Webhook / Backend FitSuite Pro - LICENCIAS + MP OAuth
-// - Fuente de verdad centralizada en gimnasios/{gymId}/licencia/datos (version: 2 + rev++)
-// - Cache para cliente de escritorio en gimnasios/{gymId}/config/config
-// - Módulos y límites normalizados (limits: maxDevices, maxBranches, maxOfflineHours, maxMembers)
-// - Dispositivos (claim/heartbeat/revoke) para multi-PC por plan
-// - Membresías y Tienda (checkout + webhooks) [opcional, puedes comentar si no usas]
+// → Esquema referidos alineado con Program.cs (Cloud Run)
+// - Fuente de verdad licencia: gimnasios/{gymId}/licencia/datos (v2 + rev++)
+// - Caché cliente escritorio: gimnasios/{gymId}/config/config
+// - Referidos:
+//   * Índice global: referralCodes/{CODE} -> { gymId }
+//   * Por gym: gimnasios/{gymId}/referrals/config { myCode, totalReferrals, discountTier(0..20), … }
+//   * Registro de uso en signup: gimnasios/{buyerGym}/referrals/applied_pending { usedCode, referrerGymId, status:"pending" }
+//   * Webhook licencia: consume pending, acredita al referrer, actualiza tier/points e historial
 // Requiere: Node 18+, express, firebase-admin, mercadopago, dotenv
 // ======================================================
 
@@ -137,9 +140,7 @@ function normalizePlanModules(plan) {
 }
 
 function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
-  // Soporta:
-  // - raíz: maxDevices, maxBranches, maxOfflineHours, maxMembers/maxUsuarios
-  // - anidado: limits.maxDevices, limits.maxBranches, limits.maxOfflineHours, limits.maxMembers
+  // Soporta raíz o anidado en limits.*
   const lim = Object.assign({}, plan.limits || {});
   const norm = {
     maxMembers:      Number(lim.maxMembers      ?? plan.maxMembers ?? plan.maxUsuarios ?? fallbackMaxUsuarios ?? 0),
@@ -147,12 +148,90 @@ function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
     maxBranches:     Number(lim.maxBranches     ?? plan.maxBranches ?? 1),
     maxOfflineHours: Number(lim.maxOfflineHours ?? plan.maxOfflineHours ?? 168)
   };
-  // saneo mínimos razonables
   if (Number.isNaN(norm.maxDevices) || norm.maxDevices < 1) norm.maxDevices = 1;
   if (Number.isNaN(norm.maxBranches) || norm.maxBranches < 1) norm.maxBranches = 1;
   if (Number.isNaN(norm.maxOfflineHours) || norm.maxOfflineHours < 24) norm.maxOfflineHours = 24;
   if (Number.isNaN(norm.maxMembers) || norm.maxMembers < 0) norm.maxMembers = 0;
   return norm;
+}
+
+// ==============================
+//  REFERIDOS — helpers (ALINEADO ESQUEMA NUEVO)
+// ==============================
+
+// Descuento por referidos del COMPRADOR: su propio discountTier (0..20)
+async function getReferralDiscountPctForBuyer(gymId) {
+  try {
+    const snap = await db.doc(`gimnasios/${gymId}/referrals/config`).get();
+    if (!snap.exists) return 0;
+    const tier = Number(snap.data()?.discountTier ?? 0);
+    if (Number.isNaN(tier)) return 0;
+    return Math.max(0, Math.min(tier, 20));
+  } catch {
+    return 0;
+  }
+}
+
+// Aplica crédito al REFERIDOR consumiendo el pending del COMPRADOR, idempotente por paymentId
+async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
+  const buyerRef = db.doc(`gimnasios/${buyerGymId}`);
+  const pendingRef = buyerRef.collection('referrals').doc('applied_pending');
+
+  const pendingSnap = await tx.get(pendingRef);
+  if (!pendingSnap.exists) return; // nada que consumir
+
+  const p = pendingSnap.data() || {};
+  if ((p.status || 'pending') !== 'pending') return; // ya consumido o ignorado
+  const referrerGymId = p.referrerGymId;
+  if (!referrerGymId || typeof referrerGymId !== 'string') return;
+  if (referrerGymId === buyerGymId) return; // guardrail
+
+  // Historia del referrer por paymentId para idempotencia fuerte (además de _mp_processed)
+  const refRoot   = db.doc(`gimnasios/${referrerGymId}`);
+  const refCfgRef = refRoot.collection('referrals').doc('config');
+  const refHistRef = refRoot.collection('referrals').doc('history').collection('items').doc(String(paymentId));
+
+  const histSnap = await tx.get(refHistRef);
+  if (histSnap.exists) {
+    // ya otorgado: solo marcar el pending como consumed por consistencia
+    tx.set(pendingRef, { status: 'consumed', consumedAt: nowTs(), paymentId: String(paymentId) }, { merge: true });
+    return;
+  }
+
+  const cfgSnap = await tx.get(refCfgRef);
+  const cfg = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
+  const prevTotal = Number(cfg.totalReferrals || 0);
+  const newTotal  = prevTotal + 1;
+  const newTier   = Math.min(20, newTotal * 4);
+
+  // Actualizo contadores del referrer
+  const cfgUpdates = {
+    totalReferrals: FieldValue.increment(1),
+    discountTier: newTier,
+    updatedAt: nowTs()
+  };
+  // Bonus a partir del 6° referido confirmado
+  if (newTotal >= 6) {
+    cfgUpdates.totalPointsEarned = FieldValue.increment(100);
+    cfgUpdates.pointsAvailable   = FieldValue.increment(100);
+  }
+  tx.set(refCfgRef, cfgUpdates, { merge: true });
+
+  // Historial del referidor
+  tx.set(refHistRef, {
+    buyerGymId,
+    paymentId: String(paymentId),
+    planId,
+    at: nowTs()
+  }, { merge: true });
+
+  // Consumir el pending del comprador
+  tx.set(pendingRef, {
+    status: 'consumed',
+    consumedAt: nowTs(),
+    paymentId: String(paymentId),
+    referrerGymId
+  }, { merge: true });
 }
 
 // ==============================
@@ -232,21 +311,6 @@ async function getValidGymAccessToken(gymId) {
   return access_token;
 }
 
-// ==============================
-//  REFERIDOS — helpers (opcional)
-// ==============================
-async function getReferralDiscountPctForBuyer(gymId) {
-  try {
-    const snap = await db.collection('referidos').doc(gymId).get();
-    const data = snap.exists ? (snap.data() || {}) : {};
-    const usos = Number(data.usosValidos || data.usos || 0);
-    const pct = Math.max(0, Math.min(usos, 20)); // TOPE 20%
-    return pct;
-  } catch {
-    return 0;
-  }
-}
-
 // =======================================================
 //  LICENCIAS — procesar pago por paymentId (idempotente)
 // =======================================================
@@ -258,11 +322,10 @@ async function processLicensePaymentById(paymentId) {
     }
 
     const extRef = payment.external_reference || '';
-    // gym:{gymId}|plan:{planId}|ref:{referidor?}|disc:{pct?}
-    const [gymPart, planPart, refPart] = extRef.split('|');
+    // external_reference sigue como: gym:{gymId}|plan:{planId}|ref:{...}|disc:{pct}
+    const [gymPart, planPart] = extRef.split('|');
     const gimnasioId = gymPart?.split(':')[1];
     const planId     = planPart?.split(':')[1];
-    const referidoDe = refPart?.split(':')[1] || null;
 
     if (!gimnasioId || !planId) {
       console.warn('external_reference inesperado:', extRef);
@@ -321,8 +384,8 @@ async function processLicensePaymentById(paymentId) {
           status: 'active',
           plan: planId,
           planNombre: planObj.nombre || planId,
-          fechaInicio: fechaInicio,           // mantenemos nombres legacy para el cliente
-          fechaVencimiento: fechaVencimiento, // idem
+          fechaInicio: fechaInicio,           // nombres legacy para el cliente
+          fechaVencimiento: fechaVencimiento,
           usoTrial: false,
           licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
           modulosPlan: modulesMap,            // legacy
@@ -348,7 +411,7 @@ async function processLicensePaymentById(paymentId) {
       };
       transaction.set(licenciaCfg, dataCfg, { merge: true });
 
-      // 1.ter) CACHE para el cliente de escritorio: gimnasios/{gymId}/config/config
+      // 1.ter) CACHE escritorio: gimnasios/{gymId}/config/config
       const modulosActivados = {};
       for (const [k, v] of Object.entries(modulesMap)) if (v) modulosActivados[k] = true;
 
@@ -360,16 +423,15 @@ async function processLicensePaymentById(paymentId) {
         licenciaTier: tier,
         licenciaPrecio: montoOriginal,
         modulosPlan: modulesMap,
-        modulosActivados, // mapa booleano
-        limits,           // también en la caché
+        modulosActivados,
+        limits,
         ultimaActualizacionLicencia: FieldValue.serverTimestamp()
       }, { merge: true });
 
-      // 2) historial
+      // 2) historial de pagos de licencia
       transaction.set(historialRef, {
         fecha: nowTs(),
         plan: planId,
-        referidoDe,
         descuentoAplicado,
         montoPagado
       }, { merge: true });
@@ -379,7 +441,6 @@ async function processLicensePaymentById(paymentId) {
         monto: montoPagado,
         fecha: nowTs(),
         metodo: payment.payment_type_id,
-        referidoDe,
         descuentoAplicado,
         tipo: 'licencia',
         detalle: `Licencia ${planId} - ${payment.description || ''}`
@@ -393,24 +454,14 @@ async function processLicensePaymentById(paymentId) {
         }, { merge: true });
       }
 
-      // 5) referidos (crédito one-time al referidor) — opcional
-      if (referidoDe) {
-        const refRoot    = db.collection('referidos').doc(referidoDe);
-        const creditRef  = refRoot.collection('creditos').doc(gimnasioId);
-        const creditSnap = await transaction.get(creditRef);
-        if (!creditSnap.exists) {
-          transaction.set(refRoot, { usosValidos: FieldValue.increment(1) }, { merge: true });
-          transaction.set(refRoot, { descuentoAcumulado: FieldValue.increment(descuentoAplicado) }, { merge: true });
-          transaction.set(creditRef, {
-            gymReferidoId: gimnasioId,
-            firstPaymentId: String(payment.id),
-            plan: planId,
-            createdAt: nowTs()
-          });
-        }
-      }
+      // 5) REFERIDOS — acreditar al referrer consumiendo el pending del comprador (ALINEADO)
+      await applyReferralCreditInTx(transaction, {
+        buyerGymId: gimnasioId,
+        paymentId: String(payment.id),
+        planId
+      });
 
-      // marca de idempotencia (protege todo el bloque)
+      // 6) marca de idempotencia global
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
     });
 
@@ -443,7 +494,7 @@ app.get('/crear-link-pago', async (req, res) => {
     const planObj = await readPlanById(String(plan));
     const precio = Number(planObj.precio || 0);
 
-    // descuento por referidos del COMPRADOR (tope 20%)
+    // descuento por referidos del COMPRADOR (tope 20%) — esquema nuevo
     const pct          = await getReferralDiscountPctForBuyer(gimnasioId);
     const factor       = Math.max(0, 1 - pct / 100);
     const precioConDto = Number((precio * factor).toFixed(2));
@@ -461,12 +512,7 @@ app.get('/crear-link-pago', async (req, res) => {
       }],
       ...(pct > 0 ? { coupon_code: `REFERIDOS_${pct}`, coupon_amount: discountAmt } : {}),
       statement_descriptor: 'NICHEAS GYM',
-      metadata: {
-        gimnasioId, plan,
-        ref: ref || null,
-        descuento_pct: pct,
-        precio_original: precio
-      },
+      // external_reference conserva ref y disc por compat, pero el crédito real sale de applied_pending
       external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
       notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`,
       back_urls: {
