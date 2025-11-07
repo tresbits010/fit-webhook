@@ -10,6 +10,7 @@
 //   * Registro de uso en signup: gimnasios/{buyerGym}/referrals/applied_pending { usedCode, referrerGymId, status:"pending" }
 //   * Webhook licencia: consume pending, acredita al referrer, actualiza tier/points e historial
 //   * NOTIFICACIÓN IN-APP al REFERIDOR (idempotente por paymentId) en gimnasios/{referrer}/inbox/items/{paymentId}
+//   * NOTIFICACIÓN IN-APP al COMPRADOR (idempotente por paymentId) en gimnasios/{gymId}/inbox/items/lic-{paymentId}
 // Requiere: Node 18+, express, firebase-admin, mercadopago, dotenv
 // Vars obligatorias: FIREBASE_CREDENTIALS (JSON), MP_ACCESS_TOKEN
 // Opcionales: BRAND_NAME
@@ -250,6 +251,67 @@ function getReferralInboxHtml({ referrerGymName, buyerGymName, usedCode }) {
 `;
 }
 
+// === NUEVO: INBOX (licencia activada/renovada) - HTML + escritor idempotente ===
+function getLicenseInboxHtml({ brand, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado }) {
+  const accent = '#22c55e';
+  const fmt = (d) => {
+    try {
+      const date = d?.toDate?.() ? d.toDate() : (d instanceof Date ? d : new Date(d));
+      return new Intl.DateTimeFormat('es-AR', {
+        timeZone:'America/Argentina/Buenos_Aires',
+        year:'numeric', month:'2-digit', day:'2-digit'
+      }).format(date);
+    } catch { return '—'; }
+  };
+
+  return `
+<!doctype html><meta charset="utf-8">
+<body style="margin:0;background:#0f1220;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#e9eefb">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 0"><tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#151936;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden">
+      <tr><td style="padding:24px 28px;background:linear-gradient(135deg, ${accent}, #16a34a); color:#fff">
+        <h1 style="margin:0;font-size:20px;letter-spacing:.3px">${brand}</h1>
+        <p style="margin:6px 0 0 0;opacity:.95">Licencia activada</p>
+      </td></tr>
+      <tr><td style="padding:28px">
+        <h2 style="margin:0 0 12px 0;font-size:22px;color:#fff">¡Tu licencia está activa! ✅</h2>
+        <p style="margin:0 0 16px 0;line-height:1.55;color:#cfd6ee">
+          Plan: <b style="color:#fff">${escapeHtml(planNombre)}</b><br/>
+          Vigencia: <b style="color:#fff">${fmt(fechaInicio)}</b> → <b style="color:#fff">${fmt(fechaVencimiento)}</b>
+        </p>
+        ${Number(descuentoAplicado||0) > 0 ? `<p style="margin:0 0 12px 0;color:#9aa3c7">Incluye descuento aplicado de <b>${descuentoAplicado}%</b>.</p>` : ``}
+        <p style="margin:16px 0 0 0;font-size:12px;color:#9aa3c7">Podés ver tus módulos activos en <b>Configuración → Licencia</b>.</p>
+      </td></tr>
+      <tr><td style="padding:16px 28px;background:#0f122a;color:#9aa3c7;font-size:12px">
+        © ${new Date().getFullYear()} ${brand}. Todos los derechos reservados.
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body>`;
+}
+
+async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado }) {
+  const inboxRef = db.doc(`gimnasios/${gymId}/inbox/items/lic-${String(paymentId)}`);
+  const html = getLicenseInboxHtml({
+    brand: BRAND,
+    planNombre,
+    fechaInicio,
+    fechaVencimiento,
+    descuentoAplicado
+  });
+  await inboxRef.set({
+    type: 'license_activated',
+    title: `✅ Licencia activada: ${planNombre}`,
+    html,
+    planNombre,
+    start: fechaInicio,
+    end: fechaVencimiento,
+    discountPct: Number(descuentoAplicado || 0),
+    createdAt: nowTs(),
+    unread: true
+  }, { merge: true });
+}
+
 // Crea/inserta mensaje en inbox del referidor (idempotente por paymentId)
 async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode, paymentId }) {
   // nombres legibles
@@ -344,7 +406,7 @@ async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
     discountTier: newTier,
     updatedAt: nowTs()
   };
-  // Bonus puntos (+100 por cada referido confirmado). Si querés condicionar a partir del 6°, cambiá acá.
+  // Bonus puntos (+100 por cada referido confirmado)
   cfgUpdates.totalPointsEarned = FieldValue.increment(100);
   cfgUpdates.pointsAvailable   = FieldValue.increment(100);
 
@@ -490,6 +552,12 @@ async function processLicensePaymentById(paymentId) {
     const historialRef  = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
     const prefRef       = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
 
+    // ⬇️ Variables para notificación de COMPRADOR post-TX
+    let planNombre_forInbox = null;
+    let fechaInicio_forInbox = null;
+    let fechaVenc_forInbox = null;
+    let descuento_forInbox = 0;
+
     await db.runTransaction(async (transaction) => {
       // ⛑️ idempotencia: si ya procesamos este payment, salimos
       const already = await transaction.get(txIdRef);
@@ -515,6 +583,12 @@ async function processLicensePaymentById(paymentId) {
       const descuentoAplicado = (montoOriginal > 0)
         ? Math.round((1 - (montoPagado / montoOriginal)) * 100)
         : 0;
+
+      // Guardar para inbox (fuera de TX)
+      planNombre_forInbox = (planObj.nombre || planId);
+      fechaInicio_forInbox = fechaInicio;
+      fechaVenc_forInbox = fechaVencimiento;
+      descuento_forInbox = descuentoAplicado;
 
       // 1) licencia/datos — FUENTE DE VERDAD (schema v2 + rev++)
       transaction.set(
@@ -606,7 +680,21 @@ async function processLicensePaymentById(paymentId) {
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
     });
 
-    // === NOTIFICACIÓN IN-APP post-transacción (no bloquea) ===
+    // === NOTIFICACIÓN IN-APP para el COMPRADOR: "Licencia activada" (idempotente) ===
+    try {
+      await createLicenseInboxMessage({
+        gymId: gimnasioId,
+        paymentId: String(payment.id),
+        planNombre: planNombre_forInbox || (planId),
+        fechaInicio: fechaInicio_forInbox,
+        fechaVencimiento: fechaVenc_forInbox,
+        descuentoAplicado: descuento_forInbox
+      });
+    } catch (e) {
+      console.warn('createLicenseInboxMessage warn:', e?.message);
+    }
+
+    // === NOTIFICACIÓN IN-APP para el REFERIDOR (si corresponde) ===
     try {
       const approved = await db.doc(`gimnasios/${gimnasioId}/referrals/applied_approved`).get();
       if (approved.exists) {
