@@ -9,13 +9,16 @@
 //   * Por gym: gimnasios/{gymId}/referrals/config { myCode, totalReferrals, discountTier(0..20), … }
 //   * Registro de uso en signup: gimnasios/{buyerGym}/referrals/applied_pending { usedCode, referrerGymId, status:"pending" }
 //   * Webhook licencia: consume pending, acredita al referrer, actualiza tier/points e historial
-// Requiere: Node 18+, express, firebase-admin, mercadopago, dotenv
+//   * Email al REFERIDOR en pago aprobado (idempotente por paymentId)
+// Requiere: Node 18+, express, firebase-admin, mercadopago, dotenv, nodemailer
+// Vars SMTP: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, BRAND_NAME (opcional)
 // ======================================================
 
 const express = require('express');
 const mercadopago = require('mercadopago'); // SOLO para licencias (tu cuenta)
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
+const nodemailer = require('nodemailer');
 dotenv.config();
 
 const app = express();
@@ -49,6 +52,7 @@ function normalize(s) {
 function nowTs() {
   return FieldValue.serverTimestamp();
 }
+const BRAND = process.env.BRAND_NAME || 'FitSuite Pro';
 
 // 🔎 Zona horaria a usar para “cierre de día”
 const BA_TZ = 'America/Argentina/Buenos_Aires';
@@ -156,6 +160,127 @@ function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
 }
 
 // ==============================
+//  MAILER (SMTP) + HTML
+// ==============================
+function makeMailer() {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || `no-reply@${(host || 'example.com').replace(/^smtp\./, '')}`;
+
+  if (!host || !user || !pass) {
+    console.warn('✉️  Mailer deshabilitado (faltan SMTP_HOST/SMTP_USER/SMTP_PASS). Se hará console.log del HTML.');
+    return {
+      async send({ to, subject, html }) {
+        console.log('---- EMAIL (simulado) ----');
+        console.log('To:', to);
+        console.log('Subject:', subject);
+        console.log(html);
+        console.log('--------------------------');
+        return { simulated: true };
+      },
+      from
+    };
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass }
+  });
+
+  return {
+    async send({ to, subject, html }) {
+      return transporter.sendMail({ from, to, subject, html });
+    },
+    from
+  };
+}
+
+function getReferralEmailHtml({ referrerGymName, buyerGymName, usedCode, paymentId }) {
+  const accent = '#6366F1';
+  return `
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>${BRAND} · Nuevo referido confirmado</title>
+</head>
+<body style="margin:0;background:#0f1220;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#e9eefb">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:32px 0">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#151936;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden">
+          <tr>
+            <td style="padding:24px 28px;background:linear-gradient(135deg, ${accent}, #8b5cf6); color:#fff">
+              <h1 style="margin:0;font-size:20px;letter-spacing:.3px">${BRAND}</h1>
+              <p style="margin:6px 0 0 0;opacity:.95">Programa de referidos</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px">
+              <h2 style="margin:0 0 12px 0;font-size:22px;color:#fff">¡Nuevo referido confirmado! 🎉</h2>
+              <p style="margin:0 0 16px 0;line-height:1.55;color:#cfd6ee">
+                El gimnasio <b style="color:#fff">${escapeHtml(buyerGymName)}</b> completó un pago usando tu código
+                <b style="color:#fff">${escapeHtml(usedCode)}</b>.
+              </p>
+              <div style="margin:18px 0;padding:14px 16px;border:1px solid #2a2f52;border-radius:10px;background:#111530">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;color:#cfd6ee">
+                  <tr>
+                    <td style="padding:4px 0;width:140px;color:#9aa3c7">Referidor</td>
+                    <td style="padding:4px 0"><b style="color:#fff">${escapeHtml(referrerGymName)}</b></td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 0;color:#9aa3c7">Gimnasio referido</td>
+                    <td style="padding:4px 0">${escapeHtml(buyerGymName)}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 0;color:#9aa3c7">Código usado</td>
+                    <td style="padding:4px 0">${escapeHtml(usedCode)}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:4px 0;color:#9aa3c7">ID de pago</td>
+                    <td style="padding:4px 0">${escapeHtml(String(paymentId))}</td>
+                  </tr>
+                </table>
+              </div>
+              <p style="margin:0 0 18px 0;line-height:1.55;color:#cfd6ee">
+                Tu <b style="color:#fff">descuento</b> para la próxima renovación aumentó y (si aplica) sumaste <b style="color:#fff">puntos de premio</b>.
+              </p>
+              <div style="text-align:center;margin:24px 0 8px">
+                <a href="#" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600">Ver mi progreso</a>
+              </div>
+              <p style="margin:16px 0 0 0;font-size:12px;color:#9aa3c7">Este es un mensaje automático. Si tenés dudas, respondé este correo.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 28px;background:#0f122a;color:#9aa3c7;font-size:12px">
+              © ${new Date().getFullYear()} ${BRAND}. Todos los derechos reservados.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
+}
+
+// helper seguro para HTML
+function escapeHtml(s) {
+  return String(s || '')
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'",'&#39;');
+}
+
+// ==============================
 //  REFERIDOS — helpers (ALINEADO ESQUEMA NUEVO)
 // ==============================
 
@@ -173,6 +298,7 @@ async function getReferralDiscountPctForBuyer(gymId) {
 }
 
 // Aplica crédito al REFERIDOR consumiendo el pending del COMPRADOR, idempotente por paymentId
+// Además: escribe applied_approved (para lectura post-TX y envío de email)
 async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
   const buyerRef = db.doc(`gimnasios/${buyerGymId}`);
   const pendingRef = buyerRef.collection('referrals').doc('applied_pending');
@@ -182,18 +308,29 @@ async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
 
   const p = pendingSnap.data() || {};
   if ((p.status || 'pending') !== 'pending') return; // ya consumido o ignorado
+
+  const usedCode = p.usedCode;
   const referrerGymId = p.referrerGymId;
+
   if (!referrerGymId || typeof referrerGymId !== 'string') return;
   if (referrerGymId === buyerGymId) return; // guardrail
 
   // Historia del referrer por paymentId para idempotencia fuerte (además de _mp_processed)
-  const refRoot   = db.doc(`gimnasios/${referrerGymId}`);
-  const refCfgRef = refRoot.collection('referrals').doc('config');
+  const refRoot    = db.doc(`gimnasios/${referrerGymId}`);
+  const refCfgRef  = refRoot.collection('referrals').doc('config');
   const refHistRef = refRoot.collection('referrals').doc('history').collection('items').doc(String(paymentId));
 
   const histSnap = await tx.get(refHistRef);
   if (histSnap.exists) {
-    // ya otorgado: solo marcar el pending como consumed por consistencia
+    // ya otorgado: solo marcar el pending como consumed y dejar aplicado
+    tx.set(buyerRef.collection('referrals').doc('applied_approved'), {
+      usedCode: usedCode || null,
+      referrerGymId,
+      approvedAt: nowTs(),
+      paymentId: String(paymentId),
+      planId
+    }, { merge: true });
+
     tx.set(pendingRef, { status: 'consumed', consumedAt: nowTs(), paymentId: String(paymentId) }, { merge: true });
     return;
   }
@@ -225,13 +362,78 @@ async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
     at: nowTs()
   }, { merge: true });
 
-  // Consumir el pending del comprador
+  // Consumir el pending y registrar aprobado en el COMPRADOR
+  tx.set(buyerRef.collection('referrals').doc('applied_approved'), {
+    usedCode: usedCode || null,
+    referrerGymId,
+    approvedAt: nowTs(),
+    paymentId: String(paymentId),
+    planId
+  }, { merge: true });
+
   tx.set(pendingRef, {
     status: 'consumed',
     consumedAt: nowTs(),
     paymentId: String(paymentId),
     referrerGymId
   }, { merge: true });
+
+  // Crear marca idempotente de email (en el referidor)
+  const notifRef = refRoot.collection('referrals').doc('notifications')
+                  .collection('emails').doc(String(paymentId));
+  tx.set(notifRef, {
+    buyerGymId,
+    usedCode: usedCode || null,
+    createdAt: nowTs(),
+    sentEmail: false
+  }, { merge: true });
+}
+
+// Enviar email al REFERIDOR (idempotente por paymentId)
+async function sendReferralCongratsEmail({ referrerGymId, buyerGymId, usedCode, paymentId }) {
+  const notifRef = db.doc(`gimnasios/${referrerGymId}/referrals/notifications/emails/${String(paymentId)}`);
+  const notifSnap = await notifRef.get();
+  if (notifSnap.exists && notifSnap.data()?.sentEmail === true) {
+    return { ok: true, reason: 'EMAIL_ALREADY_SENT' };
+  }
+
+  // obtener admin del referidor
+  const adminQ = await db.collection(`gimnasios/${referrerGymId}/usuarios`).where('rol', '==', 'admin').limit(1).get();
+  if (adminQ.empty) {
+    await notifRef.set({ failed: true, failReason: 'NO_ADMIN_EMAIL', checkedAt: nowTs() }, { merge: true });
+    return { ok: false, reason: 'NO_ADMIN_EMAIL' };
+  }
+  const adminDoc = adminQ.docs[0].data();
+  const to = adminDoc.email;
+  if (!to) {
+    await notifRef.set({ failed: true, failReason: 'NO_ADMIN_EMAIL', checkedAt: nowTs() }, { merge: true });
+    return { ok: false, reason: 'NO_ADMIN_EMAIL' };
+  }
+
+  // nombres legibles
+  const refGymSnap = await db.doc(`gimnasios/${referrerGymId}`).get();
+  const buyerGymSnap = await db.doc(`gimnasios/${buyerGymId}`).get();
+
+  const refName   = (refGymSnap.exists ? (refGymSnap.data()?.nombre) : null) || referrerGymId;
+  const buyerName = (buyerGymSnap.exists ? (buyerGymSnap.data()?.nombre) : null) || buyerGymId;
+
+  const mailer = makeMailer();
+  const subject = `🎉 ¡Nuevo referido confirmado! ${buyerName} usó tu código`;
+  const html = getReferralEmailHtml({
+    referrerGymName: refName,
+    buyerGymName: buyerName,
+    usedCode: usedCode || '—',
+    paymentId
+  });
+
+  try {
+    await mailer.send({ to, subject, html });
+    await notifRef.set({ sentEmail: true, sentAt: nowTs() }, { merge: true });
+    return { ok: true, mailed: true };
+  } catch (err) {
+    await notifRef.set({ failed: true, failReason: String(err), checkedAt: nowTs() }, { merge: true });
+    return { ok: false, reason: 'MAIL_ERROR', error: String(err) };
+  }
 }
 
 // ==============================
@@ -322,7 +524,7 @@ async function processLicensePaymentById(paymentId) {
     }
 
     const extRef = payment.external_reference || '';
-    // external_reference sigue como: gym:{gymId}|plan:{planId}|ref:{...}|disc:{pct}
+    // external_reference: gym:{gymId}|plan:{planId}|ref:{...}|disc:{pct}
     const [gymPart, planPart] = extRef.split('|');
     const gimnasioId = gymPart?.split(':')[1];
     const planId     = planPart?.split(':')[1];
@@ -454,7 +656,7 @@ async function processLicensePaymentById(paymentId) {
         }, { merge: true });
       }
 
-      // 5) REFERIDOS — acreditar al referrer consumiendo el pending del comprador (ALINEADO)
+      // 5) REFERIDOS — acreditar al referrer consumiendo el pending del comprador (ALINEADO + email marker)
       await applyReferralCreditInTx(transaction, {
         buyerGymId: gimnasioId,
         paymentId: String(payment.id),
@@ -464,6 +666,25 @@ async function processLicensePaymentById(paymentId) {
       // 6) marca de idempotencia global
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
     });
+
+    // === EMAIL post-transacción (no bloquea) ===
+    try {
+      const approved = await db.doc(`gimnasios/${gimnasioId}/referrals/applied_approved`).get();
+      if (approved.exists) {
+        const usedCode = approved.data()?.usedCode || null;
+        const referrerGymId = approved.data()?.referrerGymId || null;
+        if (referrerGymId) {
+          await sendReferralCongratsEmail({
+            referrerGymId,
+            buyerGymId: gimnasioId,
+            usedCode,
+            paymentId: String(payment.id)
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('sendReferralCongratsEmail warn:', e?.message);
+    }
 
     // notificación (no bloquea)
     try {
@@ -608,6 +829,18 @@ app.get(['/success','/exito','/éxito'], async (req, res) => {
 app.get('/failure', (req, res) => res.status(200).send(successHtml('El pago no pudo completarse ❌')));
 app.get('/pending', (req, res) => res.status(200).send(successHtml('Pago pendiente ⏳')));
 app.get(['/','/ok','/health'], (req,res)=> res.send('OK'));
+
+// === Ruta opcional de previsualización del email (DEV) ===
+app.get('/_preview/referral-email', (req, res) => {
+  const html = getReferralEmailHtml({
+    referrerGymName: req.query.refName || 'Gimnasio Referidor',
+    buyerGymName: req.query.buyerName || 'Gimnasio Nuevo',
+    usedCode: req.query.code || 'FIT-GYM-AB12',
+    paymentId: req.query.paymentId || '1234567890'
+  });
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+});
 
 // ==============================
 //  OAUTH MERCADO PAGO (gimnasios)
