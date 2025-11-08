@@ -136,6 +136,67 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
   await inboxRef.set({ type:'referral_credit', title:'🎉 Nuevo referido confirmado', html, usedCode: usedCode||null, buyerGymId, createdAt: nowTs(), unread:true }, { merge:true });
 }
 
+// === INBOX (licencia) ===
+function getLicenseInboxHtml({ brand, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
+  const accent = eventType === 'license_upgraded' ? '#0ea5e9'
+               : eventType === 'license_renewed'  ? '#f59e0b'
+               : '#22c55e';
+  const head   = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
+               : eventType === 'license_renewed'  ? '¡Licencia renovada! 🔁'
+               : '¡Tu licencia está activa! ✅';
+  const fmt = (d) => {
+    try {
+      const date = d?.toDate?.() ? d.toDate() : (d instanceof Date ? d : new Date(d));
+      return new Intl.DateTimeFormat('es-AR',{ timeZone:'America/Argentina/Buenos_Aires', year:'numeric', month:'2-digit', day:'2-digit'}).format(date);
+    } catch { return '—'; }
+  };
+  return `<!doctype html><meta charset="utf-8">
+  <body style="margin:0;background:#0f1220;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#e9eefb">
+    <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 0"><tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:#151936;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden">
+        <tr><td style="padding:24px 28px;background:linear-gradient(135deg, ${accent}, #6366f1); color:#fff">
+          <h1 style="margin:0;font-size:20px;letter-spacing:.3px">${brand}</h1>
+          <p style="margin:6px 0 0 0;opacity:.95">Licencia</p>
+        </td></tr>
+        <tr><td style="padding:28px">
+          <h2 style="margin:0 0 12px 0;font-size:22px;color:#fff">${head}</h2>
+          <p style="margin:0 0 12px 0;color:#cfd6ee">Plan: <b style="color:#fff">${escapeHtml(planNombre)}</b></p>
+          <p style="margin:0 0 12px 0;line-height:1.55;color:#cfd6ee">Vigencia: <b style="color:#fff">${fmt(fechaInicio)}</b> → <b style="color:#fff">${fmt(fechaVencimiento)}</b></p>
+          ${Number(descuentoAplicado||0) > 0 ? `<p style="margin:0 0 12px 0;color:#9aa3c7">Incluye descuento aplicado de <b>${descuentoAplicado}%</b>.</p>` : ``}
+          <p style="margin:16px 0 0 0;font-size:12px;color:#9aa3c7">Podés ver módulos activos en <b>Configuración → Licencia</b>.</p>
+        </td></tr>
+        <tr><td style="padding:16px 28px;background:#0f122a;color:#9aa3c7;font-size:12px">© ${new Date().getFullYear()} ${brand}. Todos los derechos reservados.</td></tr>
+      </table>
+    </td></tr></table>
+  </body>`;
+}
+async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
+  const inboxRef = db.doc(`gimnasios/${gymId}/inbox/items/lic-${String(paymentId)}`);
+  const html = getLicenseInboxHtml({
+    brand: BRAND,
+    planNombre,
+    fechaInicio,
+    fechaVencimiento,
+    descuentoAplicado,
+    eventType
+  });
+  const title =
+    eventType === 'license_upgraded' ? `🔼 Plan mejorado: ${planNombre}` :
+    eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
+                                       `✅ Licencia activada: ${planNombre}`;
+  await inboxRef.set({
+    type: eventType,
+    title,
+    html,
+    planNombre,
+    start: fechaInicio,
+    end: fechaVencimiento,
+    discountPct: Number(descuentoAplicado || 0),
+    createdAt: nowTs(),
+    unread: true
+  }, { merge: true });
+}
+
 // ==============================
 //  REFERIDOS (nuevo esquema)
 // ==============================
@@ -273,6 +334,13 @@ async function processLicensePaymentById(paymentId) {
     const historialRef  = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
     const prefRef       = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
 
+    // Variables para INBOX (se completan dentro de la TX)
+    let planNombre_forInbox = null;
+    let fechaInicio_forInbox = null;
+    let fechaVenc_forInbox = null;
+    let descuento_forInbox = 0;
+    let eventType_forInbox = 'license_activated';
+
     await db.runTransaction(async (transaction) => {
       // idempotencia
       const already = await transaction.get(txIdRef);
@@ -293,11 +361,18 @@ async function processLicensePaymentById(paymentId) {
       const expiry = new Date(fechaInicio); expiry.setDate(expiry.getDate() + duracion);
       const expiryIso = expiry.toISOString();
 
-      // Preservables (licenseId / graceHours) si existen
+      // Estado previo para clasificar evento y preservar campos
       const prevSnap = await transaction.get(licenciaDatos);
       const prev = prevSnap.exists ? (prevSnap.data() || {}) : {};
+      const prevPlan = prev?.plan || null;
       const prevLicenseId = typeof prev.licenseId === 'string' ? prev.licenseId : null;
       const prevGrace = Number(prev.graceHours ?? 72);
+
+      // Clasificación evento
+      let eventType = 'license_activated';
+      if (prevSnap.exists && prev.status === 'active') {
+        eventType = (prevPlan && prevPlan !== String(planId)) ? 'license_upgraded' : 'license_renewed';
+      }
 
       const montoPagado = Number(payment.transaction_amount || 0);
       const descuentoAplicado = (montoOriginal > 0)
@@ -317,8 +392,7 @@ async function processLicensePaymentById(paymentId) {
         plan: String(planId),
         status: 'active',
         updatedUtc: nowTs(),                                  // Timestamp
-        // 🔥 incrementa en +1 SIEMPRE ante renovación/cambio:
-        version: FieldValue.increment(1)
+        version: FieldValue.increment(1)                      // 🔥 +1 ante renovación/cambio
       }, { merge: true });
 
       // === 1.b) licencia/config — cache/compat ===
@@ -378,7 +452,48 @@ async function processLicensePaymentById(paymentId) {
 
       // 6) marca idempotente
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
+
+      // Datos para inbox (post-TX)
+      planNombre_forInbox  = (planObj.nombre || planId);
+      fechaInicio_forInbox = fechaInicio;
+      fechaVenc_forInbox   = expiry;
+      descuento_forInbox   = descuentoAplicado;
+      eventType_forInbox   = eventType;
     });
+
+    // === Mensaje IN-APP del COMPRADOR (idempotente por lic-{paymentId}) ===
+    try {
+      await createLicenseInboxMessage({
+        gymId: gimnasioId,
+        paymentId: String(payment.id),
+        planNombre: planNombre_forInbox || String(planId),
+        fechaInicio: fechaInicio_forInbox,
+        fechaVencimiento: fechaVenc_forInbox,
+        descuentoAplicado: descuento_forInbox,
+        eventType: eventType_forInbox
+      });
+    } catch (e) {
+      console.warn('createLicenseInboxMessage warn:', e?.message);
+    }
+
+    // === Mensaje IN-APP al REFERIDOR (si approved existe) ===
+    try {
+      const approved = await db.doc(`gimnasios/${gimnasioId}/referrals/applied_approved`).get();
+      if (approved.exists) {
+        const usedCode = approved.data()?.usedCode || null;
+        const referrerGymId = approved.data()?.referrerGymId || null;
+        if (referrerGymId) {
+          await createReferralInboxMessage({
+            referrerGymId,
+            buyerGymId: gimnasioId,
+            usedCode,
+            paymentId: String(payment.id)
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('createReferralInboxMessage warn:', e?.message);
+    }
 
     return { ok:true };
   } catch (e) {
@@ -544,9 +659,7 @@ app.post('/devices/revoke', async (req,res)=>{
 });
 
 // ==============================
-//  (Opcional) Membresías / Tienda — idénticos a tu versión previa
-//  (si los estás usando ahora, pegá aquí tus handlers tal cual;
-//   no afectan el cambio de version++).
+//  (Opcional) Membresías / Tienda — iguales a tu versión previa
 // ==============================
 
 // ==============================
