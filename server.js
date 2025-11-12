@@ -132,8 +132,27 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
   const refName = (refGymSnap.exists ? (refGymSnap.data()?.nombre) : null) || referrerGymId;
   const buyerName = (buyerGymSnap.exists ? (buyerGymSnap.data()?.nombre) : null) || buyerGymId;
   const html = getReferralInboxHtml({ referrerGymName: refName, buyerGymName: buyerName, usedCode: usedCode || null });
-  const inboxRef = db.doc(`gimnasios/${referrerGymId}/inbox/items/${String(paymentId)}`);
-  await inboxRef.set({ type:'referral_credit', title:'🎉 Nuevo referido confirmado', html, usedCode: usedCode||null, buyerGymId, createdAt: nowTs(), unread:true }, { merge:true });
+
+  // colección: gimnasios/{referrerGymId}/inbox/{docId}
+  const inboxRef = db
+    .collection('gimnasios')
+    .doc(referrerGymId)
+    .collection('inbox')
+    .doc(`ref-${String(paymentId)}`);
+
+  await inboxRef.set({
+    type: 'referral_credit',
+    source: 'referral',
+    level: 'info',
+    title: '🎉 Nuevo referido confirmado',
+    html,
+    usedCode: usedCode || null,
+    buyerGymId,
+    tags: ['referral', 'referido'],
+    displayUrl: null,
+    createdAt: nowTs(),
+    unread: true
+  }, { merge:true });
 }
 
 // === INBOX (licencia) ===
@@ -171,7 +190,14 @@ function getLicenseInboxHtml({ brand, planNombre, fechaInicio, fechaVencimiento,
   </body>`;
 }
 async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
-  const inboxRef = db.doc(`gimnasios/${gymId}/inbox/items/lic-${String(paymentId)}`);
+
+  // colección: gimnasios/{gymId}/inbox/{docId}
+  const inboxRef = db
+    .collection('gimnasios')
+    .doc(gymId)
+    .collection('inbox')
+    .doc(`lic-${String(paymentId)}`);
+
   const html = getLicenseInboxHtml({
     brand: BRAND,
     planNombre,
@@ -185,13 +211,17 @@ async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaIn
     eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
                                        `✅ Licencia activada: ${planNombre}`;
   await inboxRef.set({
-    type: eventType,
+    type: eventType,             // license_activated | license_renewed | license_upgraded
+    source: 'license',
+    level: 'info',
     title,
     html,
     planNombre,
     start: fechaInicio,
     end: fechaVencimiento,
     discountPct: Number(descuentoAplicado || 0),
+    tags: ['licencia', 'license'],
+    displayUrl: null,
     createdAt: nowTs(),
     unread: true
   }, { merge: true });
@@ -670,3 +700,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
