@@ -209,7 +209,7 @@ async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaIn
   const title =
     eventType === 'license_upgraded' ? `🔼 Plan mejorado: ${planNombre}` :
     eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
-                                       `✅ Licencia activada: ${planNombre}`;
+                                     `✅ Licencia activada: ${planNombre}`;
   await inboxRef.set({
     type: eventType,             // license_activated | license_renewed | license_upgraded
     source: 'license',
@@ -624,6 +624,73 @@ app.get('/failure', (req,res)=> res.status(200).send(successHtml('El pago no pud
 app.get('/pending', (req,res)=> res.status(200).send(successHtml('Pago pendiente ⏳')));
 app.get(['/','/ok','/health'], (req,res)=> res.send('OK'));
 
+// =======================================================
+//  NUEVO: Rutas para OAuth desde App de Escritorio
+// =======================================================
+
+// 1. Callback donde MP nos devuelve al usuario (Browser)
+app.get('/mp/oauth/callback', async (req, res) => {
+  const { code, state } = req.query; // "state" traerá el gymId
+  
+  if (!code || !state) return res.status(400).send('Faltan datos (code/state)');
+  
+  try {
+    // A. Canjeamos el código por el Token real
+    const redirectUri = `${process.env.PUBLIC_BASE_URL}/mp/oauth/callback`;
+    const tokenData = await mpOAuthTokenExchange({ code, redirectUri });
+
+    // B. Guardamos el token en Firebase (Cloud)
+    // Se guarda en: gimnasios/{gymId}/integraciones/mp
+    const gymId = state; 
+    await db.doc(`gimnasios/${gymId}/integraciones/mp`).set({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      public_key: tokenData.public_key,
+      user_id: tokenData.user_id,
+      expires_at: Date.now() + (tokenData.expires_in * 1000),
+      updated_at: nowTs()
+    }, { merge: true });
+
+    // C. Mostramos mensaje de éxito al usuario
+    return res.send(`
+      <!doctype html>
+      <body style="font-family:sans-serif;text-align:center;padding:50px;background:#f0f9ff;">
+        <h1 style="color:#0284c7;">¡Conexión Exitosa!</h1>
+        <p>Ya hemos guardado tus credenciales en la nube.</p>
+        <p>Puedes cerrar esta ventana y volver a FitSuite Pro.</p>
+        <script>window.opener=null;window.open("","_self");window.close();</script>
+      </body>
+    `);
+
+  } catch (error) {
+    console.error('OAuth Callback Error:', error);
+    return res.status(500).send(`Error vinculando: ${error.message}`);
+  }
+});
+
+// 2. Endpoint para que la App de Escritorio descargue el token (Polling)
+app.get('/gimnasios/:gymId/sync-token', async (req, res) => {
+  const { gymId } = req.params;
+  try {
+    const doc = await db.doc(`gimnasios/${gymId}/integraciones/mp`).get();
+    if (!doc.exists) return res.status(404).json({ ok: false });
+    
+    const data = doc.data();
+    // Solo devolvemos si tiene access_token
+    if (!data.access_token) return res.status(404).json({ ok: false });
+
+    return res.json({
+      ok: true,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      public_key: data.public_key,
+      user_id: data.user_id
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ==============================
 //  DISPOSITIVOS (multi-PC)
 // ==============================
@@ -689,10 +756,6 @@ app.post('/devices/revoke', async (req,res)=>{
 });
 
 // ==============================
-//  (Opcional) Membresías / Tienda — iguales a tu versión previa
-// ==============================
-
-// ==============================
 //  Arranque
 // ==============================
 const PORT = process.env.PORT || 10000;
@@ -700,4 +763,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
-
