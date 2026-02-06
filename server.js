@@ -578,6 +578,77 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
+// =======================================================
+//  CANJE DE PUNTOS (TIENDA B2B)
+//  Recibe la orden desde C# y resta los puntos en Firebase
+// =======================================================
+app.post('/api/referrals/redeem', async (req, res) => {
+  try {
+    const { gymId, rewardId, cost } = req.body;
+
+    // 1. Validaciones básicas
+    if (!gymId || !rewardId || !cost) {
+      return res.status(400).json({ ok: false, error: 'Faltan datos' });
+    }
+
+    const costInt = Number(cost);
+    if (costInt <= 0) return res.status(400).json({ ok: false, error: 'Costo inválido' });
+
+    // Referencias a Firebase
+    const gymRef = db.collection('gimnasios').doc(gymId);
+    const configRef = gymRef.collection('referrals').doc('config');
+    const historyRef = gymRef.collection('referrals').doc('history').collection('redemptions').doc();
+
+    // 2. Transacción en Firebase (Para asegurar que no gaste puntos que no tiene)
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(configRef);
+      const data = doc.exists ? doc.data() : {};
+      
+      const currentPoints = Number(data.pointsAvailable || 0);
+      const currentRedeemed = Number(data.pointsRedeemed || 0);
+
+      // Verificamos si le alcanza
+      if (currentPoints < costInt) {
+        throw new Error('INSUFFICIENT_FUNDS'); 
+      }
+
+      // Restamos puntos disponibles y sumamos a canjeados
+      t.set(configRef, {
+        pointsAvailable: currentPoints - costInt,
+        pointsRedeemed: currentRedeemed + costInt,
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      // Guardamos el historial del canje (Qué compró y cuándo)
+      t.set(historyRef, {
+        rewardId: rewardId,
+        cost: costInt,
+        status: 'pending_delivery', // Queda pendiente para que tú sepas que tienes que entregarlo
+        redeemedAt: FieldValue.serverTimestamp()
+      });
+    });
+
+    // 3. Notificar al dueño (Inbox) - Opcional
+    /* await db.collection('gimnasios').doc(gymId).collection('inbox').add({
+        title: 'Canje Exitoso',
+        body: `Has canjeado ${costInt} puntos. Nos contactaremos pronto.`,
+        createdAt: FieldValue.serverTimestamp(),
+        read: false
+    }); 
+    */
+
+    console.log(`✅ Canje exitoso: Gym ${gymId} gastó ${costInt} puntos en ${rewardId}`);
+    return res.json({ ok: true });
+
+  } catch (error) {
+    console.error('❌ Error en canje:', error);
+    if (error.message === 'INSUFFICIENT_FUNDS') {
+      return res.status(400).json({ ok: false, error: 'Puntos insuficientes' });
+    }
+    return res.status(500).json({ ok: false, error: 'Error interno del servidor' });
+  }
+});
+
 // ==============================
 //  Webhook licencias + páginas retorno
 // ==============================
@@ -763,3 +834,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
