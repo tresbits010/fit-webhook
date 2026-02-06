@@ -579,27 +579,33 @@ app.get('/crear-link-pago', async (req, res) => {
 });
 
 // =======================================================
-//  CANJE DE PUNTOS (TIENDA B2B)
-//  Recibe la orden desde C# y resta los puntos en Firebase
+//  CANJE DE PUNTOS (VERSIÓN FIREBASE DIRECTO)
 // =======================================================
 app.post('/api/referrals/redeem', async (req, res) => {
   try {
     const { gymId, rewardId, cost } = req.body;
 
-    // 1. Validaciones básicas
     if (!gymId || !rewardId || !cost) {
       return res.status(400).json({ ok: false, error: 'Faltan datos' });
     }
 
     const costInt = Number(cost);
-    if (costInt <= 0) return res.status(400).json({ ok: false, error: 'Costo inválido' });
-
-    // Referencias a Firebase
+    
+    // Referencias del Gimnasio (Cliente)
     const gymRef = db.collection('gimnasios').doc(gymId);
     const configRef = gymRef.collection('referrals').doc('config');
     const historyRef = gymRef.collection('referrals').doc('history').collection('redemptions').doc();
+    
+    // Referencia a TU Buzón de Admin (Colección Global)
+    // Aquí es donde tu App Dev leerá los mensajes
+    const adminInboxRef = db.collection('admin_notificaciones').doc(); 
 
-    // 2. Transacción en Firebase (Para asegurar que no gaste puntos que no tiene)
+    // 1. Obtener nombre del Gym (para que sepas quién es)
+    const gymSnap = await gymRef.get();
+    const gymName = gymSnap.exists ? (gymSnap.data().nombre || gymId) : gymId;
+    const gymPhone = gymSnap.exists ? (gymSnap.data().telefono || 'Sin datos') : '';
+
+    // 2. Transacción (Todo o nada)
     await db.runTransaction(async (t) => {
       const doc = await t.get(configRef);
       const data = doc.exists ? doc.data() : {};
@@ -607,37 +613,46 @@ app.post('/api/referrals/redeem', async (req, res) => {
       const currentPoints = Number(data.pointsAvailable || 0);
       const currentRedeemed = Number(data.pointsRedeemed || 0);
 
-      // Verificamos si le alcanza
+      // A. Verificar saldo
       if (currentPoints < costInt) {
         throw new Error('INSUFFICIENT_FUNDS'); 
       }
 
-      // Restamos puntos disponibles y sumamos a canjeados
+      // B. Restar puntos al cliente
       t.set(configRef, {
         pointsAvailable: currentPoints - costInt,
         pointsRedeemed: currentRedeemed + costInt,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
 
-      // Guardamos el historial del canje (Qué compró y cuándo)
+      // C. Guardar historial en el cliente
       t.set(historyRef, {
         rewardId: rewardId,
         cost: costInt,
-        status: 'pending_delivery', // Queda pendiente para que tú sepas que tienes que entregarlo
+        status: 'pending', // Queda en pendiente hasta que tú se lo entregues
         redeemedAt: FieldValue.serverTimestamp()
+      });
+
+      // D. ¡AVISARTE A TI! (Escribir en admin_notificaciones)
+      // Esto es lo que tu App Dev debe leer
+      t.set(adminInboxRef, {
+        tipo: 'CANJE_PREMIO',
+        titulo: `🎁 Nuevo Canje: ${gymName}`,
+        mensaje: `El gimnasio quiere canjear: ${rewardId}`,
+        datos: {
+            gymId: gymId,
+            gymName: gymName,
+            telefono: gymPhone,
+            producto: rewardId,
+            costo: costInt
+        },
+        fecha: FieldValue.serverTimestamp(),
+        leido: false,      // Para que te aparezca como "Nuevo"
+        estado: 'pendiente' // pendiente -> entregado
       });
     });
 
-    // 3. Notificar al dueño (Inbox) - Opcional
-    /* await db.collection('gimnasios').doc(gymId).collection('inbox').add({
-        title: 'Canje Exitoso',
-        body: `Has canjeado ${costInt} puntos. Nos contactaremos pronto.`,
-        createdAt: FieldValue.serverTimestamp(),
-        read: false
-    }); 
-    */
-
-    console.log(`✅ Canje exitoso: Gym ${gymId} gastó ${costInt} puntos en ${rewardId}`);
+    console.log(`✅ Canje registrado para ${gymName}: ${rewardId}`);
     return res.json({ ok: true });
 
   } catch (error) {
@@ -834,4 +849,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
 
