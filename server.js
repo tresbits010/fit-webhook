@@ -578,91 +578,7 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
-// =======================================================
-//  CANJE DE PUNTOS (VERSIÓN FIREBASE DIRECTO)
-// =======================================================
-app.post('/api/referrals/redeem', async (req, res) => {
-  try {
-    const { gymId, rewardId, cost } = req.body;
 
-    if (!gymId || !rewardId || !cost) {
-      return res.status(400).json({ ok: false, error: 'Faltan datos' });
-    }
-
-    const costInt = Number(cost);
-    
-    // Referencias del Gimnasio (Cliente)
-    const gymRef = db.collection('gimnasios').doc(gymId);
-    const configRef = gymRef.collection('referrals').doc('config');
-    const historyRef = gymRef.collection('referrals').doc('history').collection('redemptions').doc();
-    
-    // Referencia a TU Buzón de Admin (Colección Global)
-    // Aquí es donde tu App Dev leerá los mensajes
-    const adminInboxRef = db.collection('admin_notificaciones').doc(); 
-
-    // 1. Obtener nombre del Gym (para que sepas quién es)
-    const gymSnap = await gymRef.get();
-    const gymName = gymSnap.exists ? (gymSnap.data().nombre || gymId) : gymId;
-    const gymPhone = gymSnap.exists ? (gymSnap.data().telefono || 'Sin datos') : '';
-
-    // 2. Transacción (Todo o nada)
-    await db.runTransaction(async (t) => {
-      const doc = await t.get(configRef);
-      const data = doc.exists ? doc.data() : {};
-      
-      const currentPoints = Number(data.pointsAvailable || 0);
-      const currentRedeemed = Number(data.pointsRedeemed || 0);
-
-      // A. Verificar saldo
-      if (currentPoints < costInt) {
-        throw new Error('INSUFFICIENT_FUNDS'); 
-      }
-
-      // B. Restar puntos al cliente
-      t.set(configRef, {
-        pointsAvailable: currentPoints - costInt,
-        pointsRedeemed: currentRedeemed + costInt,
-        updatedAt: FieldValue.serverTimestamp()
-      }, { merge: true });
-
-      // C. Guardar historial en el cliente
-      t.set(historyRef, {
-        rewardId: rewardId,
-        cost: costInt,
-        status: 'pending', // Queda en pendiente hasta que tú se lo entregues
-        redeemedAt: FieldValue.serverTimestamp()
-      });
-
-      // D. ¡AVISARTE A TI! (Escribir en admin_notificaciones)
-      // Esto es lo que tu App Dev debe leer
-      t.set(adminInboxRef, {
-        tipo: 'CANJE_PREMIO',
-        titulo: `🎁 Nuevo Canje: ${gymName}`,
-        mensaje: `El gimnasio quiere canjear: ${rewardId}`,
-        datos: {
-            gymId: gymId,
-            gymName: gymName,
-            telefono: gymPhone,
-            producto: rewardId,
-            costo: costInt
-        },
-        fecha: FieldValue.serverTimestamp(),
-        leido: false,      // Para que te aparezca como "Nuevo"
-        estado: 'pendiente' // pendiente -> entregado
-      });
-    });
-
-    console.log(`✅ Canje registrado para ${gymName}: ${rewardId}`);
-    return res.json({ ok: true });
-
-  } catch (error) {
-    console.error('❌ Error en canje:', error);
-    if (error.message === 'INSUFFICIENT_FUNDS') {
-      return res.status(400).json({ ok: false, error: 'Puntos insuficientes' });
-    }
-    return res.status(500).json({ ok: false, error: 'Error interno del servidor' });
-  }
-});
 
 // ==============================
 //  Webhook licencias + páginas retorno
@@ -841,6 +757,85 @@ app.post('/devices/revoke', async (req,res)=>{
   }
 });
 
+// =======================================================
+//  TIENDA B2B: CATÁLOGO Y CANJE
+// =======================================================
+
+// 1. Obtener Catálogo (Lee de la colección global 'catalogo_premios')
+app.get('/api/referrals/catalog', async (req, res) => {
+  try {
+    const snapshot = await db.collection('catalogo_premios').where('isActive', '==', true).get();
+    
+    if (snapshot.empty) return res.json([]);
+
+    const catalogo = snapshot.docs.map(doc => ({
+      id: doc.id, 
+      ...doc.data()
+    }));
+    return res.json(catalogo);
+  } catch (error) {
+    console.error('Error catálogo:', error);
+    return res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// 2. Canjear Premio (Resta puntos y avisa al Admin)
+app.post('/api/referrals/redeem', async (req, res) => {
+  try {
+    const { gymId, rewardId, cost } = req.body;
+    if (!gymId || !rewardId || !cost) return res.status(400).json({ ok: false, error: 'Datos incompletos' });
+
+    const costInt = Number(cost);
+    const gymRef = db.collection('gimnasios').doc(gymId);
+    const configRef = gymRef.collection('referrals').doc('config');
+    const historyRef = gymRef.collection('referrals').doc('history').collection('redemptions').doc();
+    const adminInboxRef = db.collection('admin_notificaciones').doc(); 
+
+    // Obtener datos del gym para la notificación
+    const gymSnap = await gymRef.get();
+    const gymName = gymSnap.exists ? (gymSnap.data().nombre || gymId) : gymId;
+    const gymPhone = gymSnap.exists ? (gymSnap.data().telefono || 'Sin datos') : '';
+
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(configRef);
+      const data = doc.exists ? doc.data() : {};
+      const currentPoints = Number(data.pointsAvailable || 0);
+      const currentRedeemed = Number(data.pointsRedeemed || 0);
+
+      if (currentPoints < costInt) throw new Error('INSUFFICIENT_FUNDS'); 
+
+      // A. Restar puntos
+      t.set(configRef, {
+        pointsAvailable: currentPoints - costInt,
+        pointsRedeemed: currentRedeemed + costInt,
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      // B. Historial Cliente
+      t.set(historyRef, {
+        rewardId, cost: costInt, status: 'pending', redeemedAt: FieldValue.serverTimestamp()
+      });
+
+      // C. Notificación para TI (Admin App)
+      t.set(adminInboxRef, {
+        tipo: 'CANJE_PREMIO',
+        titulo: `🎁 Nuevo Canje: ${gymName}`,
+        mensaje: `El gimnasio quiere canjear: ${rewardId}`,
+        datos: { gymId, gymName, telefono: gymPhone, producto: rewardId, costo: costInt },
+        fecha: FieldValue.serverTimestamp(),
+        leido: false,
+        estado: 'pendiente'
+      });
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Error canje:', error);
+    if (error.message === 'INSUFFICIENT_FUNDS') return res.status(400).json({ ok: false, error: 'Puntos insuficientes' });
+    return res.status(500).json({ ok: false });
+  }
+});
+
 // ==============================
 //  Arranque
 // ==============================
@@ -849,5 +844,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
 
 
