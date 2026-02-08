@@ -115,16 +115,50 @@ function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
 //  INBOX (HTML) — utilidades
 // ==============================
 function escapeHtml(s){return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");}
-function getReferralInboxHtml({ referrerGymName, buyerGymName, usedCode }) {
-  const accent='#6366F1';
-  return `<!doctype html><meta charset="utf-8"><body style="margin:0;background:#0f1220;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#e9eefb">
-  <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 0"><tr><td align="center">
-  <table width="600" cellpadding="0" cellspacing="0" style="background:#151936;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden">
-  <tr><td style="padding:24px 28px;background:linear-gradient(135deg, ${accent}, #8b5cf6); color:#fff">
-  <h1 style="margin:0;font-size:20px;letter-spacing:.3px">${BRAND}</h1><p style="margin:6px 0 0 0;opacity:.95">Programa de referidos</p></td></tr>
-  <tr><td style="padding:28px"><h2 style="margin:0 0 12px 0;font-size:22px;color:#fff">¡Nuevo referido confirmado! 🎉</h2>
-  <p style="margin:0 0 16px 0;line-height:1.55;color:#cfd6ee">El gimnasio <b style="color:#fff">${escapeHtml(buyerGymName)}</b> usó tu código <b style="color:#fff">${escapeHtml(usedCode||'—')}</b>.</p>
-  </td></tr></table></td></tr></table></body>`;
+
+// Centralizamos la firma para que todos los mensajes luzcan igual
+function getSignatureHtml() {
+    // Configura tus redes aquí
+    const redes = [
+        { link: "https://fitsuite.pro", icon: "https://cdn-icons-png.flaticon.com/512/1006/1006771.png" },
+        { link: "https://instagram.com/fitsuitepro", icon: "https://cdn-icons-png.flaticon.com/512/174/174855.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733547.png" }, // Facebook
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/3046/3046121.png" }, // TikTok
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/5969/5969020.png" }, // X
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/1384/1384060.png" }, // YouTube
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/174/174857.png" }, // LinkedIn
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733585.png" }, // WhatsApp
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/10095/10095493.png" }, // Threads
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/145/145808.png" }  // Pinterest
+    ];
+
+    let redesHtml = "";
+    redes.forEach(red => {
+        if (red.link) {
+            redesHtml += `
+            <a href='${red.link}' target='_blank' style='text-decoration:none; margin-right:15px; display:inline-block;'>
+                <img src='${red.icon}' width='28' height='28' style='filter: brightness(0) invert(1); opacity: 0.8; border:0;'>
+            </a>`;
+        }
+    });
+
+    const urlLogo = "https://i.ibb.co/276yLnyr/perfil-default.png"; // Reemplazar por tu logo real
+
+    return `
+    <div style='margin-top: 50px; padding-top: 30px; border-top: 1px solid #333;'>
+        <table style='width: 100%; margin-bottom: 20px;'>
+            <tr>
+                <td style='width: 80px;'>
+                    <img src='${urlLogo}' style='width: 75px; height: 75px; border-radius: 50%; border: 3px solid #FF9800;' />
+                </td>
+                <td style='padding-left: 20px;'>
+                    <h3 style='margin: 0; color: #fff; font-size: 22px;'>FitSuite Pro</h3>
+                    <p style='margin: 5px 0 0 0; color: #FF9800; font-size: 14px; letter-spacing: 1px;'>SOFTWARE DE GESTIÓN FITNESS</p>
+                </td>
+            </tr>
+        </table>
+        <div style='padding-left: 5px;'>${redesHtml}</div>
+    </div>`;
 }
 async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode, paymentId }) {
   const refGymSnap = await db.doc(`gimnasios/${referrerGymId}`).get();
@@ -156,38 +190,45 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
 }
 
 // === INBOX (licencia) ===
-function getLicenseInboxHtml({ brand, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
-  const accent = eventType === 'license_upgraded' ? '#0ea5e9'
-               : eventType === 'license_renewed'  ? '#f59e0b'
-               : '#22c55e';
-  const head   = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
+function getLicenseInboxHtml({ planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
+    const head = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
                : eventType === 'license_renewed'  ? '¡Licencia renovada! 🔁'
                : '¡Tu licencia está activa! ✅';
-  const fmt = (d) => {
-    try {
-      const date = d?.toDate?.() ? d.toDate() : (d instanceof Date ? d : new Date(d));
-      return new Intl.DateTimeFormat('es-AR',{ timeZone:'America/Argentina/Buenos_Aires', year:'numeric', month:'2-digit', day:'2-digit'}).format(date);
-    } catch { return '—'; }
-  };
-  return `<!doctype html><meta charset="utf-8">
-  <body style="margin:0;background:#0f1220;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#e9eefb">
-    <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 0"><tr><td align="center">
-      <table width="600" cellpadding="0" cellspacing="0" style="background:#151936;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden">
-        <tr><td style="padding:24px 28px;background:linear-gradient(135deg, ${accent}, #6366f1); color:#fff">
-          <h1 style="margin:0;font-size:20px;letter-spacing:.3px">${brand}</h1>
-          <p style="margin:6px 0 0 0;opacity:.95">Licencia</p>
-        </td></tr>
-        <tr><td style="padding:28px">
-          <h2 style="margin:0 0 12px 0;font-size:22px;color:#fff">${head}</h2>
-          <p style="margin:0 0 12px 0;color:#cfd6ee">Plan: <b style="color:#fff">${escapeHtml(planNombre)}</b></p>
-          <p style="margin:0 0 12px 0;line-height:1.55;color:#cfd6ee">Vigencia: <b style="color:#fff">${fmt(fechaInicio)}</b> → <b style="color:#fff">${fmt(fechaVencimiento)}</b></p>
-          ${Number(descuentoAplicado||0) > 0 ? `<p style="margin:0 0 12px 0;color:#9aa3c7">Incluye descuento aplicado de <b>${descuentoAplicado}%</b>.</p>` : ``}
-          <p style="margin:16px 0 0 0;font-size:12px;color:#9aa3c7">Podés ver módulos activos en <b>Configuración → Licencia</b>.</p>
-        </td></tr>
-        <tr><td style="padding:16px 28px;background:#0f122a;color:#9aa3c7;font-size:12px">© ${new Date().getFullYear()} ${brand}. Todos los derechos reservados.</td></tr>
-      </table>
-    </td></tr></table>
-  </body>`;
+
+    const fmt = (d) => {
+        try {
+            const date = d?.toDate?.() ? d.toDate() : (d instanceof Date ? d : new Date(d));
+            return new Intl.DateTimeFormat('es-AR',{ timeZone:'America/Argentina/Buenos_Aires', year:'numeric', month:'2-digit', day:'2-digit'}).format(date);
+        } catch { return '—'; }
+    };
+
+    return `
+    <div style='font-family: "Segoe UI", sans-serif; color: #e0e0e0; background-color: #121212; padding: 40px; width: 100%; box-sizing: border-box;'>
+        <h2 style='color: #FF9800; margin-top: 0; font-size: 28px;'>${head}</h2>
+        <p style='font-size: 18px; color: #ffffff;'>Hemos procesado el pago de tu licencia con éxito.</p>
+        
+        <div style='background: rgba(255,152,0,0.07); border-left: 5px solid #FF9800; padding: 25px; margin: 30px 0; border-radius: 8px;'>
+            <table style='width: 100%; color: #e0e0e0; font-size: 16px;'>
+                <tr>
+                    <td style='padding: 8px 0; color: #aaa; width: 150px;'>Plan:</td>
+                    <td style='padding: 8px 0; font-weight: bold;'>${escapeHtml(planNombre)}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 8px 0; color: #aaa;'>Vigencia:</td>
+                    <td style='padding: 8px 0;'>${fmt(fechaInicio)} — ${fmt(fechaVencimiento)}</td>
+                </tr>
+                ${Number(descuentoAplicado||0) > 0 ? `
+                <tr>
+                    <td style='padding: 8px 0; color: #aaa;'>Descuento:</td>
+                    <td style='padding: 8px 0; color: #4CAF50;'>${descuentoAplicado}% Aplicado</td>
+                </tr>` : ''}
+            </table>
+        </div>
+
+        <p style='color: #bbb; line-height: 1.6; font-size: 16px;'>Tu sistema ya cuenta con todas las funciones habilitadas de tu nuevo plan. ¡A darle con todo!</p>
+        
+        ${getSignatureHtml()}
+    </div>`;
 }
 async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
 
@@ -767,6 +808,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
+
 
 
 
