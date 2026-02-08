@@ -160,6 +160,22 @@ function getSignatureHtml() {
         <div style='padding-left: 5px;'>${redesHtml}</div>
     </div>`;
 }
+function getReferralInboxHtml({ buyerGymName, usedCode }) {
+    return `
+    <div style='font-family: "Segoe UI", sans-serif; color: #e0e0e0; background-color: #121212; padding: 40px; width: 100%; box-sizing: border-box;'>
+        <h2 style='color: #FF9800; margin-top: 0; font-size: 28px;'>¡Nuevo referido confirmado! 🎉</h2>
+        <p style='font-size: 18px; color: #ffffff;'>El gimnasio <strong style='color: #FF9800;'>${escapeHtml(buyerGymName)}</strong> usó tu código <strong style='color: #FF9800;'>${escapeHtml(usedCode||'—')}</strong>.</p>
+        
+        <div style='background: rgba(255,152,0,0.07); border-left: 5px solid #FF9800; padding: 25px; margin: 30px 0; border-radius: 8px;'>
+            <p style='margin: 0 0 10px 0; font-size: 0.9em; color: #FF9800; text-transform: uppercase; letter-spacing: 2px; font-weight: bold;'>Beneficio Aplicado</p>
+            <p style='margin: 0; font-size: 16px; line-height: 1.5;'>Se han acreditado los puntos en tu cuenta y tu nivel de descuento para tu próxima renovación ha sido actualizado automáticamente.</p>
+        </div>
+
+        <p style='color: #bbb; line-height: 1.6; font-size: 16px;'>Gracias por ayudarnos a expandir la comunidad de FitSuite Pro. ¡Seguí sumando referidos para obtener más beneficios!</p>
+        
+        ${getSignatureHtml()}
+    </div>`;
+}
 async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode, paymentId }) {
   const refGymSnap = await db.doc(`gimnasios/${referrerGymId}`).get();
   const buyerGymSnap = await db.doc(`gimnasios/${buyerGymId}`).get();
