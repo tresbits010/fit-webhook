@@ -116,20 +116,18 @@ function normalizePlanLimits(plan, fallbackMaxUsuarios = 0) {
 // ==============================
 function escapeHtml(s){return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");}
 
-// Centralizamos la firma para que todos los mensajes luzcan igual
 function getSignatureHtml() {
-    // Configura tus redes aquí
     const redes = [
         { link: "https://fitsuite.pro", icon: "https://cdn-icons-png.flaticon.com/512/1006/1006771.png" },
         { link: "https://instagram.com/fitsuitepro", icon: "https://cdn-icons-png.flaticon.com/512/174/174855.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733547.png" }, // Facebook
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/3046/3046121.png" }, // TikTok
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/5969/5969020.png" }, // X
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/1384/1384060.png" }, // YouTube
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/174/174857.png" }, // LinkedIn
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733585.png" }, // WhatsApp
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/10095/10095493.png" }, // Threads
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/145/145808.png" }  // Pinterest
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733547.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/3046/3046121.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/5969/5969020.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/1384/1384060.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/174/174857.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733585.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/10095/10095493.png" },
+        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/145/145808.png" } 
     ];
 
     let redesHtml = "";
@@ -142,7 +140,7 @@ function getSignatureHtml() {
         }
     });
 
-    const urlLogo = "https://i.ibb.co/276yLnyr/perfil-default.png"; // Reemplazar por tu logo real
+    const urlLogo = "https://i.ibb.co/276yLnyr/perfil-default.png";
 
     return `
     <div style='margin-top: 50px; padding-top: 30px; border-top: 1px solid #333;'>
@@ -160,6 +158,7 @@ function getSignatureHtml() {
         <div style='padding-left: 5px;'>${redesHtml}</div>
     </div>`;
 }
+
 function getReferralInboxHtml({ buyerGymName, usedCode }) {
     return `
     <div style='font-family: "Segoe UI", sans-serif; color: #e0e0e0; background-color: #121212; padding: 40px; width: 100%; box-sizing: border-box;'>
@@ -170,12 +169,11 @@ function getReferralInboxHtml({ buyerGymName, usedCode }) {
             <p style='margin: 0 0 10px 0; font-size: 0.9em; color: #FF9800; text-transform: uppercase; letter-spacing: 2px; font-weight: bold;'>Beneficio Aplicado</p>
             <p style='margin: 0; font-size: 16px; line-height: 1.5;'>Se han acreditado los puntos en tu cuenta y tu nivel de descuento para tu próxima renovación ha sido actualizado automáticamente.</p>
         </div>
-
         <p style='color: #bbb; line-height: 1.6; font-size: 16px;'>Gracias por ayudarnos a expandir la comunidad de FitSuite Pro. ¡Seguí sumando referidos para obtener más beneficios!</p>
-        
         ${getSignatureHtml()}
     </div>`;
 }
+
 async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode, paymentId }) {
   const refGymSnap = await db.doc(`gimnasios/${referrerGymId}`).get();
   const buyerGymSnap = await db.doc(`gimnasios/${buyerGymId}`).get();
@@ -183,29 +181,15 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
   const buyerName = (buyerGymSnap.exists ? (buyerGymSnap.data()?.nombre) : null) || buyerGymId;
   const html = getReferralInboxHtml({ referrerGymName: refName, buyerGymName: buyerName, usedCode: usedCode || null });
 
-  // colección: gimnasios/{referrerGymId}/inbox/{docId}
-  const inboxRef = db
-    .collection('gimnasios')
-    .doc(referrerGymId)
-    .collection('inbox')
-    .doc(`ref-${String(paymentId)}`);
-
+  const inboxRef = db.collection('gimnasios').doc(referrerGymId).collection('inbox').doc(`ref-${String(paymentId)}`);
   await inboxRef.set({
-    type: 'referral_credit',
-    source: 'referral',
-    level: 'info',
-    title: '🎉 Nuevo referido confirmado',
-    html,
-    usedCode: usedCode || null,
-    buyerGymId,
-    tags: ['referral', 'referido'],
-    displayUrl: null,
-    createdAt: nowTs(),
-    unread: true
+    type: 'referral_credit', source: 'referral', level: 'info',
+    title: '🎉 Nuevo referido confirmado', html, usedCode: usedCode || null, buyerGymId,
+    tags: ['referral', 'referido'], displayUrl: null, createdAt: nowTs(), unread: true
   }, { merge:true });
 }
 
-// === INBOX (licencia) ===
+// === INBOX (licencia activada/renovada) ===
 function getLicenseInboxHtml({ planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
     const head = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
                : eventType === 'license_renewed'  ? '¡Licencia renovada! 🔁'
@@ -240,49 +224,58 @@ function getLicenseInboxHtml({ planNombre, fechaInicio, fechaVencimiento, descue
                 </tr>` : ''}
             </table>
         </div>
-
         <p style='color: #bbb; line-height: 1.6; font-size: 16px;'>Tu sistema ya cuenta con todas las funciones habilitadas de tu nuevo plan. ¡A darle con todo!</p>
-        
         ${getSignatureHtml()}
     </div>`;
 }
+
 async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
-
-  // colección: gimnasios/{gymId}/inbox/{docId}
-  const inboxRef = db
-    .collection('gimnasios')
-    .doc(gymId)
-    .collection('inbox')
-    .doc(`lic-${String(paymentId)}`);
-
-  const html = getLicenseInboxHtml({
-    brand: BRAND,
-    planNombre,
-    fechaInicio,
-    fechaVencimiento,
-    descuentoAplicado,
-    eventType
-  });
-  const title =
-    eventType === 'license_upgraded' ? `🔼 Plan mejorado: ${planNombre}` :
-    eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
-                                       `✅ Licencia activada: ${planNombre}`;
+  const inboxRef = db.collection('gimnasios').doc(gymId).collection('inbox').doc(`lic-${String(paymentId)}`);
+  const html = getLicenseInboxHtml({ brand: BRAND, planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType });
+  const title = eventType === 'license_upgraded' ? `🔼 Plan mejorado: ${planNombre}` :
+                eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
+                                                   `✅ Licencia activada: ${planNombre}`;
   await inboxRef.set({
-    type: eventType,             // license_activated | license_renewed | license_upgraded
-    source: 'license',
-    level: 'info',
-    title,
-    html,
-    planNombre,
-    start: fechaInicio,
-    end: fechaVencimiento,
-    discountPct: Number(descuentoAplicado || 0),
-    tags: ['licencia', 'license'],
-    displayUrl: null,
-    createdAt: nowTs(),
-    unread: true
+    type: eventType, source: 'license', level: 'info', title, html, planNombre, start: fechaInicio,
+    end: fechaVencimiento, discountPct: Number(descuentoAplicado || 0), tags: ['licencia', 'license'],
+    displayUrl: null, createdAt: nowTs(), unread: true
   }, { merge: true });
 }
+
+// === NUEVO: INBOX (Suscripción Cancelada) ===
+function getCancelInboxHtml({ fechaVencimiento }) {
+    const fmt = (d) => {
+        try {
+            const date = d?.toDate?.() ? d.toDate() : (d instanceof Date ? d : new Date(d));
+            return new Intl.DateTimeFormat('es-AR',{ timeZone:'America/Argentina/Buenos_Aires', year:'numeric', month:'2-digit', day:'2-digit'}).format(date);
+        } catch { return '—'; }
+    };
+
+    return `
+    <div style='font-family: "Segoe UI", sans-serif; color: #e0e0e0; background-color: #121212; padding: 40px; width: 100%; box-sizing: border-box;'>
+        <h2 style='color: #F44336; margin-top: 0; font-size: 28px;'>Suscripción Cancelada 🚫</h2>
+        <p style='font-size: 18px; color: #ffffff;'>Se ha registrado la baja de tu débito automático.</p>
+        
+        <div style='background: rgba(244,67,54,0.07); border-left: 5px solid #F44336; padding: 25px; margin: 30px 0; border-radius: 8px;'>
+            <p style='margin: 0; font-size: 16px; line-height: 1.5;'>Podrás seguir usando el sistema con normalidad hasta el final de tu ciclo de facturación actual:</p>
+            <p style='margin: 10px 0 0 0; font-size: 18px; font-weight: bold; color: #F44336;'>Vencimiento: ${fmt(fechaVencimiento)}</p>
+        </div>
+
+        <p style='color: #bbb; line-height: 1.6; font-size: 16px;'>Si cambiaste de opinión o fue un error, podés volver a suscribirte en cualquier momento desde tu panel. ¡Te vamos a extrañar!</p>
+        ${getSignatureHtml()}
+    </div>`;
+}
+
+async function createCancellationInboxMessage({ gymId, preapprovalId, fechaVencimiento }) {
+    const inboxRef = db.collection('gimnasios').doc(gymId).collection('inbox').doc(`cancel-${String(preapprovalId)}`);
+    const html = getCancelInboxHtml({ fechaVencimiento });
+    await inboxRef.set({
+        type: 'license_cancelled', source: 'license', level: 'warning',
+        title: '🚫 Suscripción Automática Cancelada', html, end: fechaVencimiento,
+        tags: ['licencia', 'cancelacion'], displayUrl: null, createdAt: nowTs(), unread: true
+    }, { merge: true });
+}
+
 
 // ==============================
 //  REFERIDOS (nuevo esquema)
@@ -415,28 +408,23 @@ async function processLicensePaymentById(paymentId) {
     } catch {}
 
     const gymRef        = db.collection('gimnasios').doc(gimnasioId);
-    const licenciaDatos = gymRef.collection('licencia').doc('datos');   // FUENTE (nombres conservados)
+    const licenciaDatos = gymRef.collection('licencia').doc('datos');   // FUENTE
     const licenciaCfg   = gymRef.collection('licencia').doc('config');  // caché/compat
     const txIdRef       = db.collection('_mp_processed').doc(String(payment.id));
     const historialRef  = gymRef.collection('licencia').doc('historial').collection('pagos').doc(String(payment.id));
     const prefRef       = preferenceId ? gymRef.collection('licencia').doc('prefs').collection('items').doc(preferenceId) : null;
 
-    // Variables para INBOX (se completan dentro de la TX)
     let planNombre_forInbox = null;
     let fechaInicio_forInbox = null;
     let fechaVenc_forInbox = null;
     let descuento_forInbox = 0;
     let eventType_forInbox = 'license_activated';
-
-    // 🔥 Flag para saber si hay que preparar/activar WhatsApp
     let triggerWhatsAppAutomations = false;
 
     await db.runTransaction(async (transaction) => {
-      // idempotencia
       const already = await transaction.get(txIdRef);
       if (already.exists) return;
 
-      // Leer plan y normalizar
       const planObj = await readPlanById(planId);
       const duracion      = Number(planObj.duracion ?? planObj.duracionDias ?? 30);
       const montoOriginal = Number(planObj.precio ?? 0);
@@ -446,19 +434,16 @@ async function processLicensePaymentById(paymentId) {
       const modulesMap = normalizePlanModules(planObj);
       const limits     = normalizePlanLimits(planObj, maxUsuarios);
 
-      // Fechas y expiración
       const fechaInicio = new Date();
       const expiry = new Date(fechaInicio); expiry.setDate(expiry.getDate() + duracion);
       const expiryIso = expiry.toISOString();
 
-      // Estado previo para clasificar evento y preservar campos
       const prevSnap = await transaction.get(licenciaDatos);
       const prev = prevSnap.exists ? (prevSnap.data() || {}) : {};
       const prevPlan = prev?.plan || null;
       const prevLicenseId = typeof prev.licenseId === 'string' ? prev.licenseId : null;
       const prevGrace = Number(prev.graceHours ?? 72);
 
-      // Clasificación evento
       let eventType = 'license_activated';
       if (prevSnap.exists && prev.status === 'active') {
         eventType = (prevPlan && prevPlan !== String(planId)) ? 'license_upgraded' : 'license_renewed';
@@ -469,162 +454,92 @@ async function processLicensePaymentById(paymentId) {
         ? Math.max(0, Math.round((1 - (montoPagado / montoOriginal)) * 100))
         : 0;
 
-      // === 1) licencia/datos — NOMBRES CONSERVADOS + version++ ===
       transaction.set(licenciaDatos, {
-        expiryUtc: expiryIso,                                 // ISO string
-        graceHours: prevGrace,                                // preserva o default 72
+        expiryUtc: expiryIso,
+        graceHours: prevGrace,
         licenseId: prevLicenseId || `${planId}-${dayId(new Date(), 'UTC')}`,
-        limits: {
-          maxOfflineHours: Number(limits.maxOfflineHours || 168),
-          maxUsers: Number(maxUsuarios || limits.maxMembers || 0),
-        },
-        modules: modulesMap,                                  // mapa booleano
+        limits: { maxOfflineHours: Number(limits.maxOfflineHours || 168), maxUsers: Number(maxUsuarios || limits.maxMembers || 0) },
+        modules: modulesMap,
         plan: String(planId),
         status: 'active',
-        updatedUtc: nowTs(),                                  // Timestamp
-        version: FieldValue.increment(1)                      // 🔥 +1 ante renovación/cambio
+        updatedUtc: nowTs(),
+        version: FieldValue.increment(1)
       }, { merge: true });
 
-      // === 1.b) licencia/config — cache/compat ===
       transaction.set(licenciaCfg, {
-        status: 'active',
-        plan: planId,
-        planNombre: planObj.nombre || planId,
-        start: fechaInicio,
-        expiry: expiry,
-        updatedAt: nowTs(),
-        tier,
-        limits,
-        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
+        status: 'active', plan: planId, planNombre: planObj.nombre || planId, start: fechaInicio,
+        expiry: expiry, updatedAt: nowTs(), tier, limits, licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
         modules: modulesMap
       }, { merge: true });
 
-      // === 1.c) config/config — cache escritorio ===
       const modulosActivados = {};
       for (const [k,v] of Object.entries(modulesMap)) if (v) modulosActivados[k]=true;
 
       transaction.set(gymRef.collection('config').doc('config'), {
-        licenciaPlanId: planId,
-        licenciaNombre: planObj.nombre || planId,
-        licenciaDuracionDias: duracion,
-        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
-        licenciaTier: tier,
-        licenciaPrecio: montoOriginal,
-        modulosPlan: modulesMap,
-        modulosActivados,
-        limits,
-        ultimaActualizacionLicencia: nowTs()
+        licenciaPlanId: planId, licenciaNombre: planObj.nombre || planId, licenciaDuracionDias: duracion,
+        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0, licenciaTier: tier, licenciaPrecio: montoOriginal,
+        modulosPlan: modulesMap, modulosActivados, limits, ultimaActualizacionLicencia: nowTs()
       }, { merge: true });
 
-      // 2) historial
-      transaction.set(historialRef, {
-        fecha: nowTs(),
-        plan: planId,
-        descuentoAplicado,
-        montoPagado
-      }, { merge: true });
-
-      // 3) transacciones
+      transaction.set(historialRef, { fecha: nowTs(), plan: planId, descuentoAplicado, montoPagado }, { merge: true });
+      
       transaction.set(gymRef.collection('transacciones').doc(String(payment.id)), {
-        monto: montoPagado,
-        fecha: nowTs(),
-        metodo: payment.payment_type_id,
-        descuentoAplicado,
-        tipo: 'licencia',
-        detalle: `Licencia ${planId} - ${payment.description || ''}`
+        monto: montoPagado, fecha: nowTs(), metodo: payment.payment_type_id,
+        descuentoAplicado, tipo: 'licencia', detalle: `Licencia ${planId} - ${payment.description || ''}`
       }, { merge: true });
 
-      // 4) preferencia aprobada (si existe)
       if (prefRef) transaction.set(prefRef, { status:'approved', updatedAt: nowTs() }, { merge: true });
 
-      // 5) referidos
       await applyReferralCreditInTx(transaction, { buyerGymId: gimnasioId, paymentId: String(payment.id), planId });
 
-      // 6) marca idempotente
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
 
-      // Datos para inbox (post-TX)
       planNombre_forInbox  = (planObj.nombre || planId);
       fechaInicio_forInbox = fechaInicio;
       fechaVenc_forInbox   = expiry;
       descuento_forInbox   = descuentoAplicado;
       eventType_forInbox   = eventType;
       
-      // 🔥 NUEVO: Detectar si tiene el módulo "premium"
-      if (modulesMap['premium'] === true) {
-        triggerWhatsAppAutomations = true;
-      }
+      if (modulesMap['premium'] === true) triggerWhatsAppAutomations = true;
     });
 
-    // =======================================================
-    // 🔥 CONTROL DE MÓDULO GREEN API 🔥
-    // =======================================================
     try {
       const refCredenciales = db.doc(`gimnasios/${gimnasioId}/integraciones/whatsapp`);
       const docWsp = await refCredenciales.get();
 
       if (triggerWhatsAppAutomations) {
-        // El plan es Premium. Verificamos si necesita los huecos.
         if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
           console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando huecos para Green API...`);
           await refCredenciales.set({
-            idInstance: 'PENDIENTE',
-            apiTokenInstance: 'PENDIENTE',
-            hostInstance: 'https://7103.api.greenapi.com',
-            estado: 'esperando_configuracion_manual',
-            creadoEl: nowTs()
+            idInstance: 'PENDIENTE', apiTokenInstance: 'PENDIENTE', hostInstance: 'https://7103.api.greenapi.com',
+            estado: 'esperando_configuracion_manual', creadoEl: nowTs()
           }, { merge: true });
         } else if (docWsp.data()?.estado === 'suspendido_por_plan') {
-          // Si había hecho downgrade y ahora volvió a pagar Premium, se lo reactivamos
           await refCredenciales.set({ estado: 'activa' }, { merge: true });
           console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP Reactivado.`);
         }
       } else {
-        // 🔥 EL CASO DOWNGRADE: El plan NO es Premium (Ej: compró el Básico)
-        // Si el gimnasio tenía el WhatsApp encendido de antes, se lo pausamos.
         if (docWsp.exists && docWsp.data()?.estado !== 'suspendido_por_plan' && docWsp.data()?.idInstance !== 'PENDIENTE') {
           console.log(`⚠️ Gimnasio ${gimnasioId} compró plan sin WSP. Suspendiendo integración...`);
           await refCredenciales.set({ estado: 'suspendido_por_plan' }, { merge: true });
         }
       }
-    } catch (error) {
-      console.error(`❌ Error gestionando estados de WSP para ${gimnasioId}:`, error);
-    }
-    // =======================================================
+    } catch (error) { console.error(`❌ Error gestionando estados de WSP para ${gimnasioId}:`, error); }
 
-    // === Mensaje IN-APP del COMPRADOR (idempotente por lic-{paymentId}) ===
     try {
-      await createLicenseInboxMessage({
-        gymId: gimnasioId,
-        paymentId: String(payment.id),
-        planNombre: planNombre_forInbox || String(planId),
-        fechaInicio: fechaInicio_forInbox,
-        fechaVencimiento: fechaVenc_forInbox,
-        descuentoAplicado: descuento_forInbox,
-        eventType: eventType_forInbox
-      });
-    } catch (e) {
-      console.warn('createLicenseInboxMessage warn:', e?.message);
-    }
+      await createLicenseInboxMessage({ gymId: gimnasioId, paymentId: String(payment.id), planNombre: planNombre_forInbox || String(planId), fechaInicio: fechaInicio_forInbox, fechaVencimiento: fechaVenc_forInbox, descuentoAplicado: descuento_forInbox, eventType: eventType_forInbox });
+    } catch (e) { console.warn('createLicenseInboxMessage warn:', e?.message); }
 
-    // === Mensaje IN-APP al REFERIDOR (si approved existe) ===
     try {
       const approved = await db.doc(`gimnasios/${gimnasioId}/referrals/applied_approved`).get();
       if (approved.exists) {
         const usedCode = approved.data()?.usedCode || null;
         const referrerGymId = approved.data()?.referrerGymId || null;
         if (referrerGymId) {
-          await createReferralInboxMessage({
-            referrerGymId,
-            buyerGymId: gimnasioId,
-            usedCode,
-            paymentId: String(payment.id)
-          });
+          await createReferralInboxMessage({ referrerGymId, buyerGymId: gimnasioId, usedCode, paymentId: String(payment.id) });
         }
       }
-    } catch (e) {
-      console.warn('createReferralInboxMessage warn:', e?.message);
-    }
+    } catch (e) { console.warn('createReferralInboxMessage warn:', e?.message); }
 
     return { ok:true };
   } catch (e) {
@@ -680,7 +595,7 @@ app.get('/crear-link-pago', async (req, res) => {
 });
 
 // ==============================
-//  NUEVO: Crear link de SUSCRIPCIÓN AUTOMÁTICA (-15% OFF Fijo)
+//  Crear link de SUSCRIPCIÓN AUTOMÁTICA (-15% OFF Fijo)
 // ==============================
 app.get('/crear-suscripcion', async (req, res) => {
   const { gimnasioId, plan, email, format } = req.query;
@@ -690,7 +605,6 @@ app.get('/crear-suscripcion', async (req, res) => {
     const planObj = await readPlanById(String(plan));
     const precioBase = Number(planObj.precio || 0);
 
-    // 🔥 Aplicamos el 15% de descuento permanente
     const descuentoPct = 15;
     const precioConDto = Number((precioBase * 0.85).toFixed(2));
 
@@ -703,7 +617,7 @@ app.get('/crear-suscripcion', async (req, res) => {
         frequency: 1,
         frequency_type: 'months',
         transaction_amount: precioConDto,
-        currency_id: 'ARS' // Asegurate de que esta sea la moneda correcta
+        currency_id: 'ARS' 
       },
       back_url: `${process.env.PUBLIC_BASE_URL}/success`,
       payer_email: email || 'cliente@fitsuite.pro' 
@@ -732,15 +646,66 @@ app.get('/crear-suscripcion', async (req, res) => {
   }
 });
 
-
 // ==============================
 //  Webhook licencias + páginas retorno
 // ==============================
 app.post('/webhook', async (req, res) => {
   try {
+    // MP puede mandar el topic en query params o en el body. Atajamos todo.
+    const topic = req.body?.topic || req.body?.type || req.query?.topic || req.query?.type || null;
     let paymentId = req.body?.data?.id || req.body?.id || null;
-    const topic   = req.body?.topic || req.body?.type || null;
 
+    // =======================================================
+    // 🔥 NUEVO: Atajar evento de CANCELACIÓN de Suscripción (Preapproval)
+    // =======================================================
+    if (topic === 'subscription_preapproval') {
+      const preapprovalId = req.body?.data?.id;
+      
+      if (preapprovalId) {
+        // Consultar a MP con native fetch (ya que el SDK v1 es medio tosco con preapproval)
+        const response = await fetch(`https://api.mercadopago.com/preapproval/${preapprovalId}`, {
+          headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+        });
+        
+        if (response.ok) {
+          const preapprovalData = await response.json();
+
+          // Si el estado es cancelado
+          if (preapprovalData.status === 'cancelled') {
+            const extRef = preapprovalData.external_reference || '';
+            const m = /gym:([^|]+)/.exec(extRef);
+            const gimnasioId = m ? m[1] : null;
+
+            if (gimnasioId) {
+              console.log(`⚠️ El gimnasio ${gimnasioId} CANCELÓ su suscripción.`);
+              
+              // Actualizamos en Firebase para dejar registro.
+              await db.doc(`gimnasios/${gimnasioId}/licencia/datos`).set({
+                suscripcionActiva: false,
+                fechaCancelacionSuscripcion: nowTs()
+              }, { merge: true });
+
+              // Leemos la fecha de vencimiento actual para mostrarla en el INBOX
+              const gymDoc = await db.doc(`gimnasios/${gimnasioId}/licencia/datos`).get();
+              const expiryUtc = gymDoc.exists ? gymDoc.data()?.expiryUtc : null;
+              const fechaVencimiento = expiryUtc ? new Date(expiryUtc) : new Date();
+
+              // Disparamos la notificación in-app (INBOX)
+              await createCancellationInboxMessage({
+                gymId: gimnasioId,
+                preapprovalId: preapprovalId,
+                fechaVencimiento: fechaVencimiento
+              });
+            }
+          }
+        }
+      }
+      return res.status(200).send('OK');
+    }
+
+    // =======================================================
+    // PAGOS NORMALES Y MERCHANT ORDERS
+    // =======================================================
     if (!paymentId && (topic === 'merchant_order' || req.body?.resource)) {
       const resUrl = req.body?.resource || '';
       const m = /merchant_orders\/(\d+)/.exec(resUrl);
@@ -761,7 +726,7 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ Error en webhook licencias:', error);
-    return res.status(200).send('OK'); // evitar reintentos agresivos
+    return res.status(200).send('OK'); 
   }
 });
 
@@ -780,22 +745,16 @@ app.get('/pending', (req,res)=> res.status(200).send(successHtml('Pago pendiente
 app.get(['/','/ok','/health'], (req,res)=> res.send('OK'));
 
 // =======================================================
-//  NUEVO: Rutas para OAuth desde App de Escritorio
+//  Rutas para OAuth desde App de Escritorio
 // =======================================================
-
-// 1. Callback donde MP nos devuelve al usuario (Browser)
 app.get('/mp/oauth/callback', async (req, res) => {
-  const { code, state } = req.query; // "state" traerá el gymId
-  
+  const { code, state } = req.query; 
   if (!code || !state) return res.status(400).send('Faltan datos (code/state)');
   
   try {
-    // A. Canjeamos el código por el Token real
     const redirectUri = `${process.env.PUBLIC_BASE_URL}/mp/oauth/callback`;
     const tokenData = await mpOAuthTokenExchange({ code, redirectUri });
 
-    // B. Guardamos el token en Firebase (Cloud)
-    // Se guarda en: gimnasios/{gymId}/integraciones/mp
     const gymId = state; 
     await db.doc(`gimnasios/${gymId}/integraciones/mp`).set({
       access_token: tokenData.access_token,
@@ -806,7 +765,6 @@ app.get('/mp/oauth/callback', async (req, res) => {
       updated_at: nowTs()
     }, { merge: true });
 
-    // C. Mostramos mensaje de éxito al usuario
     return res.send(`
       <!doctype html>
       <body style="font-family:sans-serif;text-align:center;padding:50px;background:#f0f9ff;">
@@ -816,14 +774,12 @@ app.get('/mp/oauth/callback', async (req, res) => {
         <script>window.opener=null;window.open("","_self");window.close();</script>
       </body>
     `);
-
   } catch (error) {
     console.error('OAuth Callback Error:', error);
     return res.status(500).send(`Error vinculando: ${error.message}`);
   }
 });
 
-// 2. Endpoint para que la App de Escritorio descargue el token (Polling)
 app.get('/gimnasios/:gymId/sync-token', async (req, res) => {
   const { gymId } = req.params;
   try {
@@ -831,7 +787,6 @@ app.get('/gimnasios/:gymId/sync-token', async (req, res) => {
     if (!doc.exists) return res.status(404).json({ ok: false });
     
     const data = doc.data();
-    // Solo devolvemos si tiene access_token
     if (!data.access_token) return res.status(404).json({ ok: false });
 
     return res.json({
