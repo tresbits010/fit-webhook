@@ -266,7 +266,7 @@ async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaIn
   const title =
     eventType === 'license_upgraded' ? `🔼 Plan mejorado: ${planNombre}` :
     eventType === 'license_renewed'  ? `🔁 Licencia renovada: ${planNombre}` :
-                                     `✅ Licencia activada: ${planNombre}`;
+                                       `✅ Licencia activada: ${planNombre}`;
   await inboxRef.set({
     type: eventType,             // license_activated | license_renewed | license_upgraded
     source: 'license',
@@ -428,6 +428,9 @@ async function processLicensePaymentById(paymentId) {
     let descuento_forInbox = 0;
     let eventType_forInbox = 'license_activated';
 
+    // 🔥 NUEVO: Flag para saber si hay que preparar WhatsApp
+    let triggerWhatsAppAutomations = false;
+
     await db.runTransaction(async (transaction) => {
       // idempotencia
       const already = await transaction.get(txIdRef);
@@ -546,7 +549,40 @@ async function processLicensePaymentById(paymentId) {
       fechaVenc_forInbox   = expiry;
       descuento_forInbox   = descuentoAplicado;
       eventType_forInbox   = eventType;
+      
+      // 🔥 NUEVO: Detectar si tiene el módulo "premium"
+      if (modulesMap['premium'] === true) {
+        triggerWhatsAppAutomations = true;
+      }
     });
+
+    // =======================================================
+    // 🔥 PREPARACIÓN MANUAL GREEN API (Día 1 Producción) 🔥
+    // =======================================================
+    if (triggerWhatsAppAutomations) {
+      try {
+        const refCredenciales = db.doc(`gimnasios/${gimnasioId}/integraciones/whatsapp`);
+        const docWsp = await refCredenciales.get();
+        
+        // Solo creamos los huecos si NO tiene datos o si dicen 'PENDIENTE'
+        if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
+          console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando Firebase para cargar Green API manualmente...`);
+          
+          await refCredenciales.set({
+            idInstance: 'PENDIENTE',
+            apiTokenInstance: 'PENDIENTE',
+            hostInstance: 'https://7103.api.greenapi.com',
+            estado: 'esperando_configuracion_manual',
+            creadoEl: nowTs()
+          }, { merge: true });
+          
+          console.log(`✅ Huecos WSP creados con éxito. Entrar a Firebase a rellenar para ${gimnasioId}.`);
+        }
+      } catch (error) {
+        console.error(`❌ Error preparando huecos WSP para ${gimnasioId}:`, error);
+      }
+    }
+    // =======================================================
 
     // === Mensaje IN-APP del COMPRADOR (idempotente por lic-{paymentId}) ===
     try {
@@ -814,8 +850,6 @@ app.post('/devices/revoke', async (req,res)=>{
   }
 });
 
-
-
 // ==============================
 //  Arranque
 // ==============================
@@ -824,7 +858,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook activo en puerto ${PORT}`);
   console.log(`🌐 Base URL: ${process.env.PUBLIC_BASE_URL || '(definir PUBLIC_BASE_URL)'}`);
 });
-
-
-
-
