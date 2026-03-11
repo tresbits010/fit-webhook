@@ -428,7 +428,7 @@ async function processLicensePaymentById(paymentId) {
     let descuento_forInbox = 0;
     let eventType_forInbox = 'license_activated';
 
-    // 🔥 NUEVO: Flag para saber si hay que preparar WhatsApp
+    // 🔥 Flag para saber si hay que preparar/activar WhatsApp
     let triggerWhatsAppAutomations = false;
 
     await db.runTransaction(async (transaction) => {
@@ -557,17 +557,16 @@ async function processLicensePaymentById(paymentId) {
     });
 
     // =======================================================
-    // 🔥 PREPARACIÓN MANUAL GREEN API (Día 1 Producción) 🔥
+    // 🔥 CONTROL DE MÓDULO GREEN API 🔥
     // =======================================================
-    if (triggerWhatsAppAutomations) {
-      try {
-        const refCredenciales = db.doc(`gimnasios/${gimnasioId}/integraciones/whatsapp`);
-        const docWsp = await refCredenciales.get();
-        
-        // Solo creamos los huecos si NO tiene datos o si dicen 'PENDIENTE'
+    try {
+      const refCredenciales = db.doc(`gimnasios/${gimnasioId}/integraciones/whatsapp`);
+      const docWsp = await refCredenciales.get();
+
+      if (triggerWhatsAppAutomations) {
+        // El plan es Premium. Verificamos si necesita los huecos.
         if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
-          console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando Firebase para cargar Green API manualmente...`);
-          
+          console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando huecos para Green API...`);
           await refCredenciales.set({
             idInstance: 'PENDIENTE',
             apiTokenInstance: 'PENDIENTE',
@@ -575,12 +574,21 @@ async function processLicensePaymentById(paymentId) {
             estado: 'esperando_configuracion_manual',
             creadoEl: nowTs()
           }, { merge: true });
-          
-          console.log(`✅ Huecos WSP creados con éxito. Entrar a Firebase a rellenar para ${gimnasioId}.`);
+        } else if (docWsp.data()?.estado === 'suspendido_por_plan') {
+          // Si había hecho downgrade y ahora volvió a pagar Premium, se lo reactivamos
+          await refCredenciales.set({ estado: 'activa' }, { merge: true });
+          console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP Reactivado.`);
         }
-      } catch (error) {
-        console.error(`❌ Error preparando huecos WSP para ${gimnasioId}:`, error);
+      } else {
+        // 🔥 EL CASO DOWNGRADE: El plan NO es Premium (Ej: compró el Básico)
+        // Si el gimnasio tenía el WhatsApp encendido de antes, se lo pausamos.
+        if (docWsp.exists && docWsp.data()?.estado !== 'suspendido_por_plan' && docWsp.data()?.idInstance !== 'PENDIENTE') {
+          console.log(`⚠️ Gimnasio ${gimnasioId} compró plan sin WSP. Suspendiendo integración...`);
+          await refCredenciales.set({ estado: 'suspendido_por_plan' }, { merge: true });
+        }
       }
+    } catch (error) {
+      console.error(`❌ Error gestionando estados de WSP para ${gimnasioId}:`, error);
     }
     // =======================================================
 
@@ -626,7 +634,7 @@ async function processLicensePaymentById(paymentId) {
 }
 
 // ==============================
-//  Crear link de pago (respeta referidos)
+//  Crear link de pago (Manual - 1 Mes)
 // ==============================
 app.get('/crear-link-pago', async (req, res) => {
   const { gimnasioId, plan, ref, format } = req.query;
@@ -671,6 +679,58 @@ app.get('/crear-link-pago', async (req, res) => {
   }
 });
 
+// ==============================
+//  NUEVO: Crear link de SUSCRIPCIÓN AUTOMÁTICA (-15% OFF Fijo)
+// ==============================
+app.get('/crear-suscripcion', async (req, res) => {
+  const { gimnasioId, plan, email, format } = req.query;
+  if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros (gimnasioId, plan)');
+
+  try {
+    const planObj = await readPlanById(String(plan));
+    const precioBase = Number(planObj.precio || 0);
+
+    // 🔥 Aplicamos el 15% de descuento permanente
+    const descuentoPct = 15;
+    const precioConDto = Number((precioBase * 0.85).toFixed(2));
+
+    const titleConDto = `Suscripción ${planObj.nombre || plan} (-15% OFF Permanente)`;
+
+    const preapprovalPayload = {
+      reason: titleConDto,
+      external_reference: `gym:${gimnasioId}|plan:${plan}|sub:true`,
+      auto_recurring: {
+        frequency: 1,
+        frequency_type: 'months',
+        transaction_amount: precioConDto,
+        currency_id: 'ARS' // Asegurate de que esta sea la moneda correcta
+      },
+      back_url: `${process.env.PUBLIC_BASE_URL}/success`,
+      payer_email: email || 'cliente@fitsuite.pro' 
+    };
+
+    const result = await mercadopago.preapproval.create(preapprovalPayload);
+
+    try { 
+      const prefRef = db.doc(`gimnasios/${gimnasioId}/licencia/prefs/items/${result.body.id}`); 
+      await prefRef.set({ plan, status:'pending_subscription', init_point: result.body.init_point, createdAt: nowTs(), updatedAt: nowTs() }, { merge:true }); 
+    } catch {}
+
+    if (format === 'json') {
+      return res.json({ 
+        init_point: result.body.init_point, 
+        id: result.body.id, 
+        descuento_pct: descuentoPct, 
+        precio_final: precioConDto 
+      });
+    }
+
+    return res.redirect(302, result.body.init_point);
+  } catch (e) {
+    console.error('Error al generar link de suscripción:', e);
+    return res.status(500).send('Error interno al crear suscripción');
+  }
+});
 
 
 // ==============================
