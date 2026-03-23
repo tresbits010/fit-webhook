@@ -508,20 +508,35 @@ async function processLicensePaymentById(paymentId) {
       const docWsp = await refCredenciales.get();
 
       if (triggerWhatsAppAutomations) {
+        // Si no tenía WSP o estaba pendiente
         if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
           console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando huecos para Green API...`);
+          
           await refCredenciales.set({
-            idInstance: 'PENDIENTE', apiTokenInstance: 'PENDIENTE', hostInstance: 'https://7103.api.greenapi.com',
-            estado: 'esperando_configuracion_manual', creadoEl: nowTs()
+            idInstance: 'PENDIENTE', 
+            apiTokenInstance: 'PENDIENTE', 
+            hostInstance: 'https://7103.api.greenapi.com',
+            estado: 'esperando_configuracion_manual', 
+            geminiApiKey: process.env.GEMINI_MASTER_KEY || "", // 🔥 LE INYECTAMOS LA CLAVE DESDE RENDER
+            creadoEl: nowTs()
           }, { merge: true });
+
         } else if (docWsp.data()?.estado === 'suspendido_por_plan') {
-          await refCredenciales.set({ estado: 'activa' }, { merge: true });
-          console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP Reactivado.`);
+          // Si el gimnasio vuelve a pagar el Premium, le reactivamos todo y le devolvemos la clave
+          await refCredenciales.set({ 
+            estado: 'activa',
+            geminiApiKey: process.env.GEMINI_MASTER_KEY || "" // 🔥 REACTIVAMOS LA IA
+          }, { merge: true });
+          console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP y Gemini Reactivados.`);
         }
       } else {
+        // Si compra un plan básico (sin WhatsApp/IA)
         if (docWsp.exists && docWsp.data()?.estado !== 'suspendido_por_plan' && docWsp.data()?.idInstance !== 'PENDIENTE') {
           console.log(`⚠️ Gimnasio ${gimnasioId} compró plan sin WSP. Suspendiendo integración...`);
-          await refCredenciales.set({ estado: 'suspendido_por_plan' }, { merge: true });
+          await refCredenciales.set({ 
+            estado: 'suspendido_por_plan',
+            geminiApiKey: FieldValue.delete() // 🔥 BORRAMOS LA CLAVE PARA QUE NO CONSUMA TOKENS
+          }, { merge: true });
         }
       }
     } catch (error) { console.error(`❌ Error gestionando estados de WSP para ${gimnasioId}:`, error); }
