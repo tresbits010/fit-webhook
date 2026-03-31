@@ -434,7 +434,7 @@ async function processLicensePaymentById(paymentId) {
       const prevSnap = await transaction.get(licenciaDatos);
       const prev = prevSnap.exists ? (prevSnap.data() || {}) : {};
 
-      // Leemos si hay referidos pendientes
+      // 🔥 ARREGLO: LEER REFERIDOS ACÁ, ANTES DE ESCRIBIR NADA 🔥
       await applyReferralCreditInTx(transaction, { buyerGymId: gimnasioId, paymentId: String(payment.id), planId });
 
       // =========================================================
@@ -582,130 +582,6 @@ async function processLicensePaymentById(paymentId) {
     return { ok:false, reason:'exception', error:e?.message };
   }
 }
-
-      // 🔥 ARREGLO: LEER REFERIDOS ACÁ, ANTES DE ESCRIBIR NADA 🔥
-      await applyReferralCreditInTx(transaction, { buyerGymId: gimnasioId, paymentId: String(payment.id), planId });
-
-      // 2. AHORA SÍ, TODAS LAS ESCRITURAS (transaction.set)
-      const prev = prevSnap.exists ? (prevSnap.data() || {}) : {};
-      const prevPlan = prev?.plan || null;
-      const prevLicenseId = typeof prev.licenseId === 'string' ? prev.licenseId : null;
-      const prevGrace = Number(prev.graceHours ?? 72);
-
-      let eventType = 'license_activated';
-      if (prevSnap.exists && prev.status === 'active') {
-        eventType = (prevPlan && prevPlan !== String(planId)) ? 'license_upgraded' : 'license_renewed';
-      }
-
-      const montoPagado = Number(payment.transaction_amount || 0);
-      const descuentoAplicado = (montoOriginal > 0)
-        ? Math.max(0, Math.round((1 - (montoPagado / montoOriginal)) * 100))
-        : 0;
-
-      transaction.set(licenciaDatos, {
-        expiryUtc: expiryIso,
-        graceHours: prevGrace,
-        licenseId: prevLicenseId || `${planId}-${dayId(new Date(), 'UTC')}`,
-        limits: { maxOfflineHours: Number(limits.maxOfflineHours || 168), maxUsers: Number(maxUsuarios || limits.maxMembers || 0) },
-        modules: modulesMap,
-        plan: String(planId),
-        status: 'active',
-        updatedUtc: nowTs(),
-        version: FieldValue.increment(1) // 🔥 ESTO HACE QUE EL ESCRITORIO SE ACTUALICE
-      }, { merge: true });
-
-      transaction.set(licenciaCfg, {
-        status: 'active', plan: planId, planNombre: planObj.nombre || planId, start: fechaInicio,
-        expiry: expiry, updatedAt: nowTs(), tier, limits, licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0,
-        modules: modulesMap
-      }, { merge: true });
-
-      const modulosActivados = {};
-      for (const [k,v] of Object.entries(modulesMap)) if (v) modulosActivados[k]=true;
-
-      transaction.set(gymRef.collection('config').doc('config'), {
-        licenciaPlanId: planId, licenciaNombre: planObj.nombre || planId, licenciaDuracionDias: duracion,
-        licenciaMaxUsuarios: maxUsuarios || limits.maxMembers || 0, licenciaTier: tier, licenciaPrecio: montoOriginal,
-        modulosPlan: modulesMap, modulosActivados, limits, ultimaActualizacionLicencia: nowTs()
-      }, { merge: true });
-
-      transaction.set(historialRef, { fecha: nowTs(), plan: planId, descuentoAplicado, montoPagado }, { merge: true });
-      
-      transaction.set(gymRef.collection('transacciones').doc(String(payment.id)), {
-        monto: montoPagado, fecha: nowTs(), metodo: payment.payment_type_id,
-        descuentoAplicado, tipo: 'licencia', detalle: `Licencia ${planId} - ${payment.description || ''}`
-      }, { merge: true });
-
-      if (prefRef) transaction.set(prefRef, { status:'approved', updatedAt: nowTs() }, { merge: true });
-
-      transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
-
-      planNombre_forInbox  = (planObj.nombre || planId);
-      fechaInicio_forInbox = fechaInicio;
-      fechaVenc_forInbox   = expiry;
-      descuento_forInbox   = descuentoAplicado;
-      eventType_forInbox   = eventType;
-      
-      if (modulesMap['premium'] === true) triggerWhatsAppAutomations = true;
-    });
-
-    try {
-      const refCredenciales = db.doc(`gimnasios/${gimnasioId}/integraciones/whatsapp`);
-      const docWsp = await refCredenciales.get();
-
-      if (triggerWhatsAppAutomations) {
-        if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
-          console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando huecos para Green API...`);
-          
-          await refCredenciales.set({
-            idInstance: 'PENDIENTE', 
-            apiTokenInstance: 'PENDIENTE', 
-            hostInstance: 'https://7103.api.greenapi.com',
-            estado: 'esperando_configuracion_manual', 
-            geminiApiKey: process.env.GEMINI_MASTER_KEY || "",
-            creadoEl: nowTs()
-          }, { merge: true });
-
-        } else if (docWsp.data()?.estado === 'suspendido_por_plan') {
-          await refCredenciales.set({ 
-            estado: 'activa',
-            geminiApiKey: process.env.GEMINI_MASTER_KEY || ""
-          }, { merge: true });
-          console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP y Gemini Reactivados.`);
-        }
-      } else {
-        if (docWsp.exists && docWsp.data()?.estado !== 'suspendido_por_plan' && docWsp.data()?.idInstance !== 'PENDIENTE') {
-          console.log(`⚠️ Gimnasio ${gimnasioId} compró plan sin WSP. Suspendiendo integración...`);
-          await refCredenciales.set({ 
-            estado: 'suspendido_por_plan',
-            geminiApiKey: FieldValue.delete()
-          }, { merge: true });
-        }
-      }
-    } catch (error) { console.error(`❌ Error gestionando estados de WSP para ${gimnasioId}:`, error); }
-
-    try {
-      await createLicenseInboxMessage({ gymId: gimnasioId, paymentId: String(payment.id), planNombre: planNombre_forInbox || String(planId), fechaInicio: fechaInicio_forInbox, fechaVencimiento: fechaVenc_forInbox, descuentoAplicado: descuento_forInbox, eventType: eventType_forInbox });
-    } catch (e) { console.warn('createLicenseInboxMessage warn:', e?.message); }
-
-    try {
-      const approved = await db.doc(`gimnasios/${gimnasioId}/referrals/applied_approved`).get();
-      if (approved.exists) {
-        const usedCode = approved.data()?.usedCode || null;
-        const referrerGymId = approved.data()?.referrerGymId || null;
-        if (referrerGymId) {
-          await createReferralInboxMessage({ referrerGymId, buyerGymId: gimnasioId, usedCode, paymentId: String(payment.id) });
-        }
-      }
-    } catch (e) { console.warn('createReferralInboxMessage warn:', e?.message); }
-
-    return { ok:true };
-  } catch (e) {
-    console.error('processLicensePaymentById error:', e);
-    return { ok:false, reason:'exception', error:e?.message };
-  }
-}
-
 // ==============================
 //  Crear link de pago (Manual - 1 Mes)
 // ==============================
