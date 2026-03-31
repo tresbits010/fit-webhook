@@ -388,7 +388,6 @@ async function processLicensePaymentById(paymentId) {
     }
 
     const extRef = payment.external_reference || '';
-    // external_reference: gym:{gymId}|plan:{planId}|ref:{...}|disc:{pct}
     const [gymPart, planPart] = extRef.split('|');
     const gimnasioId = gymPart?.split(':')[1];
     const planId     = planPart?.split(':')[1];
@@ -418,6 +417,7 @@ async function processLicensePaymentById(paymentId) {
     let triggerWhatsAppAutomations = false;
 
     await db.runTransaction(async (transaction) => {
+      // 1. TODAS LAS LECTURAS PRIMERO (Regla de oro de Firestore)
       const already = await transaction.get(txIdRef);
       if (already.exists) return;
 
@@ -435,6 +435,11 @@ async function processLicensePaymentById(paymentId) {
       const expiryIso = expiry.toISOString();
 
       const prevSnap = await transaction.get(licenciaDatos);
+
+      // 🔥 ARREGLO: LEER REFERIDOS ACÁ, ANTES DE ESCRIBIR NADA 🔥
+      await applyReferralCreditInTx(transaction, { buyerGymId: gimnasioId, paymentId: String(payment.id), planId });
+
+      // 2. AHORA SÍ, TODAS LAS ESCRITURAS (transaction.set)
       const prev = prevSnap.exists ? (prevSnap.data() || {}) : {};
       const prevPlan = prev?.plan || null;
       const prevLicenseId = typeof prev.licenseId === 'string' ? prev.licenseId : null;
@@ -459,7 +464,7 @@ async function processLicensePaymentById(paymentId) {
         plan: String(planId),
         status: 'active',
         updatedUtc: nowTs(),
-        version: FieldValue.increment(1) // 🔥 ESTO HACE QUE EL PROGRAMA DE ESCRITORIO SE DE CUENTA DEL PAGO
+        version: FieldValue.increment(1) // 🔥 ESTO HACE QUE EL ESCRITORIO SE ACTUALICE
       }, { merge: true });
 
       transaction.set(licenciaCfg, {
@@ -485,8 +490,6 @@ async function processLicensePaymentById(paymentId) {
       }, { merge: true });
 
       if (prefRef) transaction.set(prefRef, { status:'approved', updatedAt: nowTs() }, { merge: true });
-
-      await applyReferralCreditInTx(transaction, { buyerGymId: gimnasioId, paymentId: String(payment.id), planId });
 
       transaction.set(txIdRef, { processedAt: nowTs() }, { merge: true });
 
