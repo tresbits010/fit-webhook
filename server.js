@@ -1,10 +1,6 @@
 // server.js
 // ======================================================
 // Webhook / Backend FitSuite Pro - LICENCIAS + MP OAuth
-// Fuente de verdad: gimnasios/{gymId}/licencia/datos (nombres conservados)
-// Cache:            gimnasios/{gymId}/licencia/config  y  gimnasios/{gymId}/config/config
-// Referidos: índice global + consumo idempotente del pending del comprador
-// IMPORTA: en licencia/datos → version: FieldValue.increment(1) (sube +1 por renovación/cambio)
 // ======================================================
 
 const express = require('express');
@@ -78,10 +74,18 @@ function acumularIngresoDiarioTx(tx, gymId, tipo, monto, medio) {
 async function readPlanById(planId) {
   let planSnap = await db.collection('licencias').doc(planId).get();
   if (!planSnap.exists) planSnap = await db.collection('planesLicencia').doc(planId).get();
-  if (!planSnap.exists) throw new Error('Plan no encontrado');
+  
+  if (!planSnap.exists) {
+    // 🔥 SALVAVIDAS: Si olvidaste crear el plan en Firebase, usamos este por defecto para que no falle el pago.
+    console.warn(`⚠️ Plan '${planId}' no encontrado en Firestore. Usando fallback por defecto.`);
+    if (planId.toLowerCase() === 'oro') return { id: 'oro', nombre: 'Plan Oro', precio: 50, duracion: 30, maxUsuarios: 9999, modulos: { premium: true } };
+    if (planId.toLowerCase() === 'plata') return { id: 'plata', nombre: 'Plan Plata', precio: 50, duracion: 30, maxUsuarios: 200, modulos: { premium: false } };
+    throw new Error('Plan no encontrado');
+  }
   const plan = planSnap.data() || {};
   return { id: planId, ...plan };
 }
+
 function normalizePlanModules(plan) {
   const out = {};
   for (const key of ['modulosPlan','modulos','modules','features']) {
@@ -119,15 +123,7 @@ function escapeHtml(s){return String(s||'').replaceAll('&','&amp;').replaceAll('
 function getSignatureHtml() {
     const redes = [
         { link: "https://fitsuite.pro", icon: "https://cdn-icons-png.flaticon.com/512/1006/1006771.png" },
-        { link: "https://instagram.com/fitsuitepro", icon: "https://cdn-icons-png.flaticon.com/512/174/174855.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733547.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/3046/3046121.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/5969/5969020.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/1384/1384060.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/174/174857.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/733/733585.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/10095/10095493.png" },
-        { link: "", icon: "https://cdn-icons-png.flaticon.com/512/145/145808.png" } 
+        { link: "https://instagram.com/fitsuitepro", icon: "https://cdn-icons-png.flaticon.com/512/174/174855.png" }
     ];
 
     let redesHtml = "";
@@ -242,7 +238,6 @@ async function createLicenseInboxMessage({ gymId, paymentId, planNombre, fechaIn
   }, { merge: true });
 }
 
-// === NUEVO: INBOX (Suscripción Cancelada) ===
 function getCancelInboxHtml({ fechaVencimiento }) {
     const fmt = (d) => {
         try {
@@ -288,6 +283,7 @@ async function getReferralDiscountPctForBuyer(gymId) {
     return Math.max(0, Math.min(isNaN(tier)?0:tier, 20));
   } catch { return 0; }
 }
+
 async function applyReferralCreditInTx(tx, { buyerGymId, paymentId, planId }) {
   const buyerRef = db.doc(`gimnasios/${buyerGymId}`);
   const pendingRef = buyerRef.collection('referrals').doc('applied_pending');
@@ -463,7 +459,7 @@ async function processLicensePaymentById(paymentId) {
         plan: String(planId),
         status: 'active',
         updatedUtc: nowTs(),
-        version: FieldValue.increment(1)
+        version: FieldValue.increment(1) // 🔥 ESTO HACE QUE EL PROGRAMA DE ESCRITORIO SE DE CUENTA DEL PAGO
       }, { merge: true });
 
       transaction.set(licenciaCfg, {
@@ -508,7 +504,6 @@ async function processLicensePaymentById(paymentId) {
       const docWsp = await refCredenciales.get();
 
       if (triggerWhatsAppAutomations) {
-        // Si no tenía WSP o estaba pendiente
         if (!docWsp.exists || !docWsp.data()?.idInstance || docWsp.data()?.idInstance === 'PENDIENTE') {
           console.log(`🚀 Gimnasio ${gimnasioId} pagó Premium. Preparando huecos para Green API...`);
           
@@ -517,25 +512,23 @@ async function processLicensePaymentById(paymentId) {
             apiTokenInstance: 'PENDIENTE', 
             hostInstance: 'https://7103.api.greenapi.com',
             estado: 'esperando_configuracion_manual', 
-            geminiApiKey: process.env.GEMINI_MASTER_KEY || "", // 🔥 LE INYECTAMOS LA CLAVE DESDE RENDER
+            geminiApiKey: process.env.GEMINI_MASTER_KEY || "",
             creadoEl: nowTs()
           }, { merge: true });
 
         } else if (docWsp.data()?.estado === 'suspendido_por_plan') {
-          // Si el gimnasio vuelve a pagar el Premium, le reactivamos todo y le devolvemos la clave
           await refCredenciales.set({ 
             estado: 'activa',
-            geminiApiKey: process.env.GEMINI_MASTER_KEY || "" // 🔥 REACTIVAMOS LA IA
+            geminiApiKey: process.env.GEMINI_MASTER_KEY || ""
           }, { merge: true });
           console.log(`✅ Gimnasio ${gimnasioId} volvió a Premium. WSP y Gemini Reactivados.`);
         }
       } else {
-        // Si compra un plan básico (sin WhatsApp/IA)
         if (docWsp.exists && docWsp.data()?.estado !== 'suspendido_por_plan' && docWsp.data()?.idInstance !== 'PENDIENTE') {
           console.log(`⚠️ Gimnasio ${gimnasioId} compró plan sin WSP. Suspendiendo integración...`);
           await refCredenciales.set({ 
             estado: 'suspendido_por_plan',
-            geminiApiKey: FieldValue.delete() // 🔥 BORRAMOS LA CLAVE PARA QUE NO CONSUMA TOKENS
+            geminiApiKey: FieldValue.delete()
           }, { merge: true });
         }
       }
@@ -583,7 +576,7 @@ app.get('/crear-link-pago', async (req, res) => {
     const preference = {
       items: [{ title: titleConDto, description: pct>0?`Incluye descuento por referidos de ${pct}%`:titleBase, unit_price: precioConDto, quantity:1 }],
       ...(pct>0?{ coupon_code:`REFERIDOS_${pct}`, coupon_amount:discountAmt }:{}),
-      statement_descriptor: 'NICHEAS GYM',
+      statement_descriptor: 'FITSUITE PRO',
       external_reference: `gym:${gimnasioId}|plan:${plan}|ref:${ref || ''}|disc:${pct}`,
       notification_url: `${process.env.PUBLIC_BASE_URL}/webhook`,
       back_urls: {
@@ -666,18 +659,17 @@ app.get('/crear-suscripcion', async (req, res) => {
 // ==============================
 app.post('/webhook', async (req, res) => {
   try {
-    // MP puede mandar el topic en query params o en el body. Atajamos todo.
-    const topic = req.body?.topic || req.body?.type || req.query?.topic || req.query?.type || null;
-    let paymentId = req.body?.data?.id || req.body?.id || null;
+    console.log('--- NUEVO WEBHOOK DE MERCADO PAGO ---');
 
-    // =======================================================
-    // 🔥 NUEVO: Atajar evento de CANCELACIÓN de Suscripción (Preapproval)
-    // =======================================================
+    const topic = req.body?.topic || req.body?.type || req.query?.topic || req.query?.type || null;
+    
+    // 🔥 EL BUG ESTABA ACÁ: Mercado Pago a veces manda el ID en la URL (?data.id=XXX), y tu código viejo solo miraba el Body
+    let paymentId = req.body?.data?.id || req.body?.id || req.query?.['data.id'] || req.query?.id || null;
+
     if (topic === 'subscription_preapproval') {
-      const preapprovalId = req.body?.data?.id;
+      const preapprovalId = req.body?.data?.id || req.query?.['data.id'];
       
       if (preapprovalId) {
-        // Consultar a MP con native fetch (ya que el SDK v1 es medio tosco con preapproval)
         const response = await fetch(`https://api.mercadopago.com/preapproval/${preapprovalId}`, {
           headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` }
         });
@@ -685,7 +677,6 @@ app.post('/webhook', async (req, res) => {
         if (response.ok) {
           const preapprovalData = await response.json();
 
-          // Si el estado es cancelado
           if (preapprovalData.status === 'cancelled') {
             const extRef = preapprovalData.external_reference || '';
             const m = /gym:([^|]+)/.exec(extRef);
@@ -694,18 +685,15 @@ app.post('/webhook', async (req, res) => {
             if (gimnasioId) {
               console.log(`⚠️ El gimnasio ${gimnasioId} CANCELÓ su suscripción.`);
               
-              // Actualizamos en Firebase para dejar registro.
               await db.doc(`gimnasios/${gimnasioId}/licencia/datos`).set({
                 suscripcionActiva: false,
                 fechaCancelacionSuscripcion: nowTs()
               }, { merge: true });
 
-              // Leemos la fecha de vencimiento actual para mostrarla en el INBOX
               const gymDoc = await db.doc(`gimnasios/${gimnasioId}/licencia/datos`).get();
               const expiryUtc = gymDoc.exists ? gymDoc.data()?.expiryUtc : null;
               const fechaVencimiento = expiryUtc ? new Date(expiryUtc) : new Date();
 
-              // Disparamos la notificación in-app (INBOX)
               await createCancellationInboxMessage({
                 gymId: gimnasioId,
                 preapprovalId: preapprovalId,
@@ -718,9 +706,6 @@ app.post('/webhook', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    // =======================================================
-    // PAGOS NORMALES Y MERCHANT ORDERS
-    // =======================================================
     if (!paymentId && (topic === 'merchant_order' || req.body?.resource)) {
       const resUrl = req.body?.resource || '';
       const m = /merchant_orders\/(\d+)/.exec(resUrl);
@@ -735,9 +720,15 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    if (!paymentId) return res.status(200).send('OK');
+    if (!paymentId) {
+      console.log('⚠️ Webhook recibido pero sin ID de pago detectable. Ignorando.');
+      return res.status(200).send('OK');
+    }
+
+    console.log(`✅ Procesando Pago ID: ${paymentId}`);
     const r = await processLicensePaymentById(String(paymentId));
-    console.log('webhook result:', r);
+    console.log('Resultado del procesamiento:', r);
+    
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ Error en webhook licencias:', error);
