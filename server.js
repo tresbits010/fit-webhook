@@ -7,6 +7,7 @@ const express = require('express');
 const mercadopago = require('mercadopago');
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
+const crypto = require('crypto'); // 🔥 AGREGADO PARA SEGURIDAD
 dotenv.config();
 
 const app = express();
@@ -76,7 +77,6 @@ async function readPlanById(planId) {
   if (!planSnap.exists) planSnap = await db.collection('planesLicencia').doc(planId).get();
   
   if (!planSnap.exists) {
-    // 🔥 SALVAVIDAS: Si olvidaste crear el plan en Firebase, usamos este por defecto para que no falle el pago.
     console.warn(`⚠️ Plan '${planId}' no encontrado en Firestore. Usando fallback por defecto.`);
     if (planId.toLowerCase() === 'oro') return { id: 'oro', nombre: 'Plan Oro', precio: 50, duracion: 30, maxUsuarios: 9999, modulos: { premium: true } };
     if (planId.toLowerCase() === 'plata') return { id: 'plata', nombre: 'Plan Plata', precio: 50, duracion: 30, maxUsuarios: 200, modulos: { premium: false } };
@@ -185,7 +185,6 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
   }, { merge:true });
 }
 
-// === INBOX (licencia activada/renovada) ===
 function getLicenseInboxHtml({ planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
     const head = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
                : eventType === 'license_renewed'  ? '¡Licencia renovada! 🔁'
@@ -374,6 +373,55 @@ async function getValidGymAccessToken(gymId) {
     await ref.set({ access_token, refresh_token, expires_at, token_type: tokenJson.token_type || 'bearer', scope: tokenJson.scope || data.scope || null, updated_at: nowTs() }, { merge:true });
   }
   return access_token;
+}
+
+// ======================================================
+//  🔥 ESCUDO DE SEGURIDAD PARA MERCADO PAGO 🔥
+// ======================================================
+function verificarFirmaMP(req, res, next) {
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  
+  if (!secret) {
+    console.warn('⚠️ MP_WEBHOOK_SECRET no está configurado. La firma no se está validando.');
+    return next(); // Pasa de largo si no está configurado (para pruebas)
+  }
+
+  const signatureHeader = req.headers['x-signature'];
+  const requestId = req.headers['x-request-id'];
+
+  if (!signatureHeader || !requestId) {
+    console.error('❌ Intento de acceso denegado. Faltan encabezados de seguridad de MP.');
+    return res.status(403).send('Forbidden');
+  }
+
+  const parts = signatureHeader.split(',');
+  let ts = '';
+  let hashV1 = '';
+
+  parts.forEach(part => {
+    const [key, value] = part.split('=');
+    if (key && key.trim() === 'ts') ts = value;
+    if (key && key.trim() === 'v1') hashV1 = value;
+  });
+
+  const dataId = req.body?.data?.id || req.body?.id || req.query?.['data.id'] || req.query?.id;
+
+  if (!dataId) {
+    return res.status(400).send('Bad Request');
+  }
+
+  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+
+  const hmac = crypto.createHmac('sha256', secret);
+  hmac.update(manifest);
+  const sha = hmac.digest('hex');
+
+  if (sha === hashV1) {
+    next(); // Validado correctamente
+  } else {
+    console.error(`❌ Alerta de Fraude: La firma del pago ${dataId} es inválida.`);
+    return res.status(403).send('Firma Invalida');
+  }
 }
 
 // =======================================================
@@ -683,13 +731,12 @@ app.get('/crear-suscripcion', async (req, res) => {
 // ==============================
 //  Webhook licencias + páginas retorno
 // ==============================
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', verificarFirmaMP, async (req, res) => {
   try {
     console.log('--- NUEVO WEBHOOK DE MERCADO PAGO ---');
 
     const topic = req.body?.topic || req.body?.type || req.query?.topic || req.query?.type || null;
     
-    // 🔥 EL BUG ESTABA ACÁ: Mercado Pago a veces manda el ID en la URL (?data.id=XXX), y tu código viejo solo miraba el Body
     let paymentId = req.body?.data?.id || req.body?.id || req.query?.['data.id'] || req.query?.id || null;
 
     if (topic === 'subscription_preapproval') {
