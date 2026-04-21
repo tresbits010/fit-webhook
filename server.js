@@ -7,11 +7,48 @@ const express = require('express');
 const mercadopago = require('mercadopago');
 const admin = require('firebase-admin');
 const dotenv = require('dotenv');
-const crypto = require('crypto'); // 🔥 AGREGADO PARA SEGURIDAD
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit'); // 🔥 LIBRERÍA ANTI-SPAM AGREGADA
 dotenv.config();
+
+// ======================================================
+//  🔥 CAPTURA GLOBAL DE ERRORES (Escudo Anti-Crash) 🔥
+// ======================================================
+// Si ocurre un error asincrónico huérfano, lo anotamos pero NO apagamos el servidor.
+// Esto garantiza que si falla el proceso de un gimnasio, los otros 99 siguen funcionando perfecto.
+process.on('uncaughtException', (err) => {
+  console.error('❌ CRÍTICO: Excepción no capturada en el servidor:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ CRÍTICO: Promesa rechazada no manejada:', reason);
+});
 
 const app = express();
 app.use(express.json());
+
+// ======================================================
+//  🔥 ESCUDOS ANTI-SPAM / RATE LIMITING 🔥
+// ======================================================
+// 1. Límite General: Evita ataques DDoS básicos a tu servidor (Max 300 peticiones cada 5 mins por IP)
+const generalLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, 
+  max: 300, 
+  message: 'Demasiadas solicitudes detectadas. Por favor, modere el tráfico.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(generalLimiter); // Se aplica a todas las rutas por defecto
+
+// 2. Límite Estricto para Pagos: Evita que te saturen la cuenta de Mercado Pago creando links falsos (Max 15 por minuto)
+const paymentLinkLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, 
+  max: 15, 
+  message: 'Límite de generación de pagos alcanzado. Por favor, intenta en un minuto.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 
 // ==============================
 //  Firebase Admin
@@ -185,6 +222,7 @@ async function createReferralInboxMessage({ referrerGymId, buyerGymId, usedCode,
   }, { merge:true });
 }
 
+// === INBOX (licencia activada/renovada) ===
 function getLicenseInboxHtml({ planNombre, fechaInicio, fechaVencimiento, descuentoAplicado, eventType }) {
     const head = eventType === 'license_upgraded' ? '¡Plan mejorado! 🔼'
                : eventType === 'license_renewed'  ? '¡Licencia renovada! 🔁'
@@ -632,8 +670,9 @@ async function processLicensePaymentById(paymentId) {
 }
 // ==============================
 //  Crear link de pago (Manual - 1 Mes)
+//  🔥 CON PROTECCIÓN ANTI-SPAM
 // ==============================
-app.get('/crear-link-pago', async (req, res) => {
+app.get('/crear-link-pago', paymentLinkLimiter, async (req, res) => {
   const { gimnasioId, plan, ref, format } = req.query;
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros');
   try {
@@ -678,8 +717,9 @@ app.get('/crear-link-pago', async (req, res) => {
 
 // ==============================
 //  Crear link de SUSCRIPCIÓN AUTOMÁTICA (-15% OFF Fijo)
+//  🔥 CON PROTECCIÓN ANTI-SPAM
 // ==============================
-app.get('/crear-suscripcion', async (req, res) => {
+app.get('/crear-suscripcion', paymentLinkLimiter, async (req, res) => {
   const { gimnasioId, plan, email, format } = req.query;
   if (!gimnasioId || !plan) return res.status(400).send('Faltan parametros (gimnasioId, plan)');
 
