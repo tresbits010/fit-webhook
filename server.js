@@ -478,6 +478,9 @@ async function processLicensePaymentById(paymentId) {
     const gimnasioId = gymPart?.split(':')[1];
     const planId     = planPart?.split(':')[1];
     if (!gimnasioId || !planId) return { ok:false, reason:'bad_extref' };
+    
+    // 🔥 DETECCIÓN DE SUSCRIPCIÓN AUTOMÁTICA 🔥
+    const isSubscription = extRef.includes('sub:true');
 
     let preferenceId = null;
     try {
@@ -574,7 +577,8 @@ async function processLicensePaymentById(paymentId) {
         plan: String(planId),
         status: 'active',
         updatedUtc: nowTs(),
-        version: FieldValue.increment(1) // 🔥 ESTO ACTUALIZA EL ESCRITORIO
+        version: FieldValue.increment(1), // 🔥 ESTO ACTUALIZA EL ESCRITORIO
+        ...(isSubscription ? { suscripcionActiva: true } : {}) // 🔥 FLAG DE SUSCRIPCIÓN 🔥
       }, { merge: true });
 
       transaction.set(licenciaCfg, {
