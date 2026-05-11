@@ -720,7 +720,7 @@ app.get('/crear-link-pago', paymentLinkLimiter, async (req, res) => {
 });
 
 // ==============================
-//  Crear link de SUSCRIPCIÓN AUTOMÁTICA (-15% OFF Fijo)
+//  Crear link de SUSCRIPCIÓN AUTOMÁTICA (-10% OFF Fijo)
 //  🔥 CON PROTECCIÓN ANTI-SPAM
 // ==============================
 app.get('/crear-suscripcion', paymentLinkLimiter, async (req, res) => {
@@ -731,10 +731,10 @@ app.get('/crear-suscripcion', paymentLinkLimiter, async (req, res) => {
     const planObj = await readPlanById(String(plan));
     const precioBase = Number(planObj.precio || 0);
 
-    const descuentoPct = 15;
+    const descuentoPct = 10;
     const precioConDto = Number((precioBase * 0.85).toFixed(2));
 
-    const titleConDto = `Suscripción ${planObj.nombre || plan} (-15% OFF Permanente)`;
+    const titleConDto = `Suscripción ${planObj.nombre || plan} (-10% OFF Permanente)`;
 
     const preapprovalPayload = {
       reason: titleConDto,
